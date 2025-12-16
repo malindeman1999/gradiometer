@@ -425,19 +425,21 @@ def toroidal_field_fd_gradients_spherical(
     return grad_tensor
 
 
-def rss_gradient_from_emit(sim: "PhasorSimulation", positions: torch.Tensor, obs_radius: float | None = None, delta: float = 1.0) -> torch.Tensor:
+def rss_gradient_from_emit(sim: "PhasorSimulation", positions: torch.Tensor, obs_radius: float | None = None) -> torch.Tensor:
     """
-    Compute RSS of emitted B-field gradient (|∇B|) at specified positions by re-evaluating field at obs_radius.
+    Compute RSS of emitted B-field gradient (|∇B|) at specified positions using the analytic
+    toroidal field gradients (no additional differentiation).
     """
     obs_r = sim.radius_m if obs_radius is None else float(obs_radius)
     K_tor = sim.K_toroidal
-    K_pol = sim.K_poloidal if sim.K_poloidal is not None else torch.zeros_like(K_tor)
     if K_tor is None:
         raise ValueError("K_toroidal is required to evaluate emitted field at new radius.")
-    B_tor, B_pol, B_rad = inductance.spectral_b_from_surface_currents(K_tor, K_pol, radius=obs_r)
-    grad = finite_diff_gradients(B_tor, B_pol, B_rad, positions, delta=delta)
-    rss = torch.sqrt((grad.abs() ** 2).sum(dim=(-2, -1)))
-    return rss
+    # Gradients returned as [dr f, (1/r) dtheta f, (1/(r sin(theta))) dphi f]
+    _, _, _, grad_Br, grad_Btheta, grad_Bphi = toroidal_field_and_gradients_spherical(
+        K_tor, radius=obs_r, positions=positions
+    )
+    grad_tensor = torch.stack([grad_Br, grad_Btheta, grad_Bphi], dim=1)  # [N,3,3]
+    return torch.linalg.norm(grad_tensor, dim=(1, 2))
 
 
 def render_gradient_map(sim: "PhasorSimulation", altitude_m: float, subdivisions: int, save_path: str, title: str) -> None:
@@ -450,7 +452,7 @@ def render_gradient_map(sim: "PhasorSimulation", altitude_m: float, subdivisions
     radius = sim.radius_m + altitude_m
     scale = radius / sim.radius_m
     positions = (sim.grid_positions * scale).to(dtype=torch.float64)
-    rss = rss_gradient_from_emit(sim, positions, obs_radius=radius, delta=1.0)
+    rss = rss_gradient_from_emit(sim, positions, obs_radius=radius)
 
     vertices, faces, centers = _build_mesh(radius, subdivisions=subdivisions, stride=1)
     positions = positions.to(dtype=centers.dtype)

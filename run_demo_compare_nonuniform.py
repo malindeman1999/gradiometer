@@ -7,6 +7,7 @@ Variant of run_demo_compare focusing on non-uniform (spectral) admittance only.
 - Saves the self-consistent solution and renders spectral plots with the magnitude
   of the self-consistent fields on the sphere.
 """
+import argparse
 from pathlib import Path
 import math
 import time
@@ -18,6 +19,7 @@ import numpy as np
 
 from ambient_driver import build_ambient_driver_x
 from europa import inductance
+from europa.transforms import sh_forward
 from europa.config import GridConfig, ModelConfig
 from europa.simulation import Simulation
 from phasor_data import PhasorSimulation
@@ -53,10 +55,10 @@ def _clone_ps(base: PhasorSimulation) -> PhasorSimulation:
 
 
 
-def run() -> Tuple[PhasorSimulation, PhasorSimulation, str, int, bool]:
+def run(compute_gradients: bool = False) -> Tuple[PhasorSimulation, PhasorSimulation, str, int, bool]:
     # Grid and driver
     # Increase spatial resolution (double nside) and allow higher spectral order
-    lmax_target = 7
+    lmax_target = 10
     grid_cfg = GridConfig(nside=32, lmax=lmax_target, radius_m=1.56e6, device="cpu")
     _log(f"Building grid with nside={grid_cfg.nside}, lmax={grid_cfg.lmax}...")
     ambient_cfg, B_radial_spec, period_sec = build_ambient_driver_x(grid_cfg)
@@ -72,10 +74,16 @@ def run() -> Tuple[PhasorSimulation, PhasorSimulation, str, int, bool]:
         f"complete_L={complete_L}, assembled_L={gaunt_meta.get('assembled_L')}"
     )
 
-    # Complex spectral admittance up to chosen lmax
-    _log(f"Generating random spectral admittance coefficients up to L={grid_cfg.lmax}...")
-    Y_s_spectral = torch.randn((grid_cfg.lmax + 1, 2 * grid_cfg.lmax + 1), dtype=torch.complex128)
-    Y_s_spectral += 1j * torch.randn_like(Y_s_spectral)
+    # Real (conductive) spectral admittance: random conductance map projected to SH
+    sigma_3d = grid_cfg.seawater_conductivity_s_per_m
+    thickness = grid_cfg.ocean_thickness_m
+    sigma_2d_max = 2.0 * sigma_3d * thickness
+    _log(f"Assigning hemispheric conductance: north=0, south={sigma_2d_max:.2e} S (up to L={grid_cfg.lmax})...")
+    z = sim.grid.positions[:, 2].to(dtype=torch.float64)
+    conductance_grid = torch.where(z >= 0.0, torch.zeros_like(z), torch.full_like(z, sigma_2d_max))
+    weights = sim.grid.areas.to(dtype=torch.float64)
+    positions = sim.grid.positions.to(dtype=torch.float64)
+    Y_s_spectral = sh_forward(conductance_grid, positions, lmax=grid_cfg.lmax, weights=weights)
 
     base = PhasorSimulation.from_model_and_grid(
         model=model,
@@ -112,26 +120,6 @@ def run() -> Tuple[PhasorSimulation, PhasorSimulation, str, int, bool]:
         solve_spectral_self_consistent_sim_precomputed(selfc, gaunt_sparse=G_sparse, mixing_matrix=mixing_matrix)
     _log("Self-consistent solve complete.")
 
-    # Verify harmonic <-> point conversion on emitted B field
-    weights = selfc.grid_areas if selfc.grid_areas is not None else torch.ones(selfc.grid_positions.shape[0], device=selfc.grid_positions.device)
-    weights = weights.to(dtype=torch.float64)
-    B_rad_emit = selfc.B_rad_emit if selfc.B_rad_emit is not None else torch.zeros_like(selfc.B_radial)
-    B_tor_emit = selfc.B_tor_emit if selfc.B_tor_emit is not None else torch.zeros_like(selfc.B_radial)
-    B_pol_emit = selfc.B_pol_emit if selfc.B_pol_emit is not None else torch.zeros_like(selfc.B_radial)
-    _log(
-        f"Preparing harmonic<->point roundtrip on emitted B "
-        f"(nodes={selfc.grid_positions.shape[0]}, lmax={selfc.lmax}, "
-        f"|B_emit|_max={B_rad_emit.abs().max().item():.3e})"
-    )
-    with _time_block("Harmonic<->point roundtrip on emitted B"):
-        _log("  Forward: harmonics -> points")
-        B_points = harmonics_to_points(B_rad_emit, B_tor_emit, B_pol_emit, selfc.grid_positions, weights)
-        _log("  Reverse: points -> harmonics")
-        B_rad_back, B_tor_back, B_pol_back = points_to_harmonics(B_points, selfc.grid_positions, weights, lmax=selfc.lmax)
-        err_rad = (B_rad_back - B_rad_emit).abs().max().item()
-        err_tor = (B_tor_back - B_tor_emit).abs().max().item()
-        err_pol = (B_pol_back - B_pol_emit).abs().max().item()
-    _log(f"Harmonic<->point roundtrip errors: rad={err_rad:.3e}, tor={err_tor:.3e}, pol={err_pol:.3e}")
     _log("Saving phasor snapshot and launching render pipeline...")
 
     out_path = Path("figures/nonuniform_self_consistent.pt")
@@ -141,11 +129,15 @@ def run() -> Tuple[PhasorSimulation, PhasorSimulation, str, int, bool]:
     # Choose sphere sampling commensurate with spectral bandwidth (~4*(lmax+1)^2 pixels).
     desired_faces = max(20, 4 * (grid_cfg.lmax + 1) ** 2)
     subdivisions = max(1, math.ceil(math.log(desired_faces / 20, 4)))
-    return first, selfc, str(out_path), subdivisions, False
+    return first, selfc, str(out_path), subdivisions, compute_gradients
 
 
 def main() -> None:
-    first, selfc, out_path, subdivisions, compute_gradients = run()
+    parser = argparse.ArgumentParser(description="Non-uniform spectral admittance demo using precomputed Gaunt cache.")
+    parser.add_argument("--gradients", action="store_true", help="Render gradient magnitude maps.")
+    args = parser.parse_args()
+
+    first, selfc, out_path, subdivisions, compute_gradients = run(compute_gradients=args.gradients)
     # Print quick comparison metric
     diff = (first.K_toroidal - selfc.K_toroidal).abs().max().item() if first.K_toroidal is not None else float("nan")
     _log(f"Max |K_first - K_self| = {diff:.3e}")

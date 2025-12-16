@@ -24,6 +24,14 @@ def _all_checkpoints(cache_dir: Path) -> list[Path]:
     return sorted(cache_dir.glob("gaunt_wigxjpf_L*.pt"))
 
 
+def _require_all_L(ckpts: list[Path], assemble_L: int) -> None:
+    """Ensure a checkpoint exists for each L in [0, assemble_L]."""
+    have = {int(p.stem.split("_L")[-1]) for p in ckpts if "_L" in p.stem}
+    missing = [L for L in range(assemble_L + 1) if L not in have]
+    if missing:
+        raise FileNotFoundError(f"Missing Gaunt checkpoint(s) for L={missing}")
+
+
 def _load_meta(path: Path) -> dict:
     meta_path = path.with_suffix(".meta.json")
     try:
@@ -93,26 +101,16 @@ def assemble_in_memory(cache_dir: Path, lmax_limit: int | None = None, verbose: 
     if not ckpts:
         raise FileNotFoundError(f"No checkpoints found in {cache_dir}")
     total_ckpts = len(ckpts)
-    print(f"Found {total_ckpts} checkpoint file(s) in {cache_dir}; scanning coverage...", flush=True)
+    print(f"Found {total_ckpts} checkpoint file(s) in {cache_dir}; assuming coverage is complete.", flush=True)
 
     metas = [_load_meta(p) for p in ckpts]
     lmax_out, lmax_y, lmax_b = _validate_targets(metas)
+    assemble_L = lmax_out if lmax_limit is None else min(lmax_out, lmax_limit)
+    _require_all_L(ckpts, assemble_L)
 
-    coverage = [-1] * (lmax_out + 1)
-    for meta in metas:
-        _coverage_from_meta(meta, coverage)
-    complete_L = _compute_complete_L(coverage)
-    if complete_L < 0:
-        raise RuntimeError("No complete L found across checkpoints.")
-
-    assemble_L = complete_L if lmax_limit is None else min(complete_L, lmax_limit)
     lmax_y_lim = lmax_y if lmax_limit is None else min(lmax_y, lmax_limit)
     lmax_b_lim = lmax_b if lmax_limit is None else min(lmax_b, lmax_limit)
-    print(
-        f"Coverage complete through L={complete_L} (targets: lmax_out={lmax_out}, lmax_y={lmax_y}, lmax_b={lmax_b}); "
-        f"assembling up to L={assemble_L}...",
-        flush=True,
-    )
+    print(f"Assembling checkpoints up to L={assemble_L} (targets: lmax_out={lmax_out}, lmax_y={lmax_y}, lmax_b={lmax_b})...", flush=True)
 
     # Merge tensors up to assemble_L / lmax limits
     idx_all: List[List[int]] = [[], [], [], [], [], []]
@@ -186,7 +184,7 @@ def assemble_in_memory(cache_dir: Path, lmax_limit: int | None = None, verbose: 
     ).coalesce()
 
     meta_out = {
-        "complete_L": complete_L,
+        "complete_L": assemble_L,
         "assembled_L": assemble_L,
         "target_lmax_out": lmax_out,
         "target_lmax_y": lmax_y,
