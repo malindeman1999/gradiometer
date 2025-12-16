@@ -1,0 +1,47 @@
+data/
+figures/
+junk/
+planning/
+html/
+
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Logs
+*.log
+
+# Test / tooling
+.pytest_cache/
+.mypy_cache/
+*.coverage
+.coverage
+.coverage.*
+coverage.xml
+
+# Build / dist
+dist/
+build/
+
+# Data / outputs
+results/
+outputs/
