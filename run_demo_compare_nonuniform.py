@@ -53,12 +53,27 @@ def _clone_ps(base: PhasorSimulation) -> PhasorSimulation:
     return PhasorSimulation.from_serializable(base.to_serializable())
 
 
+def _checkerboard_admittance(positions: torch.Tensor, sigma_low: float, sigma_high: float, divisions: int) -> torch.Tensor:
+    """Assign a checkerboard pattern over (theta, phi) with the given number of divisions."""
+    # positions are on a sphere; compute angles
+    x, y, z = positions[:, 0], positions[:, 1], positions[:, 2]
+    r = torch.linalg.norm(positions, dim=1)
+    theta = torch.acos(torch.clamp(z / r, -1.0, 1.0))  # [0, pi]
+    phi = torch.atan2(y, x)
+    phi = torch.remainder(phi, 2 * math.pi)  # [0, 2pi)
+
+    div = max(1, divisions)
+    theta_bin = torch.floor(theta / (math.pi / div))
+    phi_bin = torch.floor(phi / (2 * math.pi / div))
+    parity = (theta_bin + phi_bin).to(torch.int64) % 2
+    return torch.where(parity == 0, torch.full_like(theta, sigma_low), torch.full_like(theta, sigma_high))
 
 
-def run(compute_gradients: bool = False) -> Tuple[PhasorSimulation, PhasorSimulation, str, int, bool]:
+
+def run(compute_gradients: bool = False, checker_divisions: int = 6) -> Tuple[PhasorSimulation, PhasorSimulation, str, int, bool]:
     # Grid and driver
     # Increase spatial resolution (double nside) and allow higher spectral order
-    lmax_target = 3
+    lmax_target = 10
     grid_cfg = GridConfig(nside=32, lmax=lmax_target, radius_m=1.56e6, device="cpu")
     _log(f"Building grid with nside={grid_cfg.nside}, lmax={grid_cfg.lmax}...")
     ambient_cfg, B_radial_spec, period_sec = build_ambient_driver_x(grid_cfg)
@@ -78,9 +93,13 @@ def run(compute_gradients: bool = False) -> Tuple[PhasorSimulation, PhasorSimula
     sigma_3d = grid_cfg.seawater_conductivity_s_per_m
     thickness = grid_cfg.ocean_thickness_m
     sigma_2d_max = 2.0 * sigma_3d * thickness
-    _log(f"Assigning hemispheric conductance: north=0, south={sigma_2d_max:.2e} S (up to L={grid_cfg.lmax})...")
-    z = sim.grid.positions[:, 2].to(dtype=torch.float64)
-    conductance_grid = torch.where(z >= 0.0, torch.zeros_like(z), torch.full_like(z, sigma_2d_max))
+    _log(
+        f"Assigning checkerboard conductance: low=0, high={sigma_2d_max:.2e} S "
+        f"(divisions={checker_divisions}, up to L={grid_cfg.lmax})..."
+    )
+    conductance_grid = _checkerboard_admittance(
+        sim.grid.positions.to(dtype=torch.float64), sigma_low=0.0, sigma_high=sigma_2d_max, divisions=checker_divisions
+    )
     weights = sim.grid.areas.to(dtype=torch.float64)
     positions = sim.grid.positions.to(dtype=torch.float64)
     Y_s_spectral = sh_forward(conductance_grid, positions, lmax=grid_cfg.lmax, weights=weights)
@@ -133,11 +152,20 @@ def run(compute_gradients: bool = False) -> Tuple[PhasorSimulation, PhasorSimula
 
 
 def main() -> None:
+    print("Starting.")
     parser = argparse.ArgumentParser(description="Non-uniform spectral admittance demo using precomputed Gaunt cache.")
     parser.add_argument("--gradients", action="store_true", help="Render gradient magnitude maps.")
+    parser.add_argument(
+        "--checker-divisions",
+        type=int,
+        default=6,
+        help="Number of theta/phi divisions for checkerboard admittance pattern.",
+    )
     args = parser.parse_args()
 
-    first, selfc, out_path, subdivisions, compute_gradients = run(compute_gradients=args.gradients)
+    first, selfc, out_path, subdivisions, compute_gradients = run(
+        compute_gradients=args.gradients, checker_divisions=args.checker_divisions
+    )
     # Print quick comparison metric
     diff = (first.K_toroidal - selfc.K_toroidal).abs().max().item() if first.K_toroidal is not None else float("nan")
     _log(f"Max |K_first - K_self| = {diff:.3e}")

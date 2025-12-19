@@ -3,18 +3,15 @@ Assemble Gaunt checkpoints into a single sparse tensor.
 
 Behavior (new format):
 - Reads per-L checkpoint files named gaunt_wigxjpf_L##.pt in the cache directory.
-  Each file contains the entries for that exact L (no .meta sidecar).
-- Verifies lmax targets match across all files.
-- Tracks coverage per L using recorded last_M/range values to detect completeness.
-- Confirms all L <= L_complete are fully covered (M=0..L) before saving.
-- Saves the merged sparse tensor to an output file with meta.
+  Each file contains the entries for that exact L (no sidecar metadata).
+  We assume files are complete for their L and non-overlapping.
 """
 from __future__ import annotations
 
 import argparse
-import json
+import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import torch
 
@@ -31,68 +28,7 @@ def _require_all_L(ckpts: list[Path], assemble_L: int) -> None:
     if missing:
         raise FileNotFoundError(f"Missing Gaunt checkpoint(s) for L={missing}")
 
-
-def _load_meta(path: Path) -> dict:
-    meta_path = path.with_suffix(".meta.json")
-    try:
-        with meta_path.open("r", encoding="ascii") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        pass
-    except json.JSONDecodeError:
-        pass
-
-    # Fallback to reading the tensor file if meta is missing/broken
-    try:
-        obj = torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        obj = torch.load(path, map_location="cpu")
-    if not isinstance(obj, dict) or ("G_sparse" not in obj and "G" not in obj):
-        raise ValueError(f"Invalid checkpoint format: {path}")
-    fallback = {
-        "target_lmax_out": int(obj.get("target_lmax_out", obj.get("lmax_out", -1))),
-        "target_lmax_y": int(obj.get("target_lmax_y", obj.get("lmax_y", -1))),
-        "target_lmax_b": int(obj.get("target_lmax_b", obj.get("lmax_b", -1))),
-        "last_L": int(obj.get("last_L", -1)),
-        "last_M": int(obj.get("last_M", -1)),
-        "range_start_L": int(obj.get("range_start_L", -1)),
-        "range_end_L": int(obj.get("range_end_L", -1)),
-    }
-    return fallback
-
-
-def _validate_targets(metas: list[dict]) -> tuple[int, int, int]:
-    outs = [int(m.get("target_lmax_out", -1)) for m in metas if "target_lmax_out" in m]
-    ys = [int(m.get("target_lmax_y", -1)) for m in metas if "target_lmax_y" in m]
-    bs = [int(m.get("target_lmax_b", -1)) for m in metas if "target_lmax_b" in m]
-    if not outs or not ys or not bs:
-        raise ValueError("Missing target lmax metadata in checkpoints.")
-    # Allow mixing runs with different targets; take the maximum to size the output.
-    return max(outs), max(ys), max(bs)
-
-
-def _coverage_from_meta(meta: dict, coverage: List[int]) -> None:
-    start = int(meta.get("range_start_L", -1))
-    end = int(meta.get("range_end_L", -1))
-    last_M = int(meta.get("last_M", -1))
-    if start < 0 or end < start:
-        return
-    end_inclusive = min(end, len(coverage) - 1)
-    for L in range(start, end_inclusive + 1):
-        coverage[L] = max(coverage[L], last_M if L == end_inclusive else L)
-
-
-def _compute_complete_L(coverage: List[int]) -> int:
-    complete_L = -1
-    for L, m in enumerate(coverage):
-        if m == L:
-            complete_L = L
-        else:
-            break
-    return complete_L
-
-
-def assemble_in_memory(cache_dir: Path, lmax_limit: int | None = None, verbose: bool = False):
+def assemble_in_memory(cache_dir: Path, lmax_limit: int, verbose: bool = False):
     """
     Assemble Gaunt checkpoints into a sparse tensor (optionally trimmed to lmax_limit) without saving.
     Returns (tensor, meta).
@@ -103,36 +39,37 @@ def assemble_in_memory(cache_dir: Path, lmax_limit: int | None = None, verbose: 
     total_ckpts = len(ckpts)
     print(f"Found {total_ckpts} checkpoint file(s) in {cache_dir}; assuming coverage is complete.", flush=True)
 
-    metas = [_load_meta(p) for p in ckpts]
-    lmax_out, lmax_y, lmax_b = _validate_targets(metas)
-    assemble_L = lmax_out if lmax_limit is None else min(lmax_out, lmax_limit)
+    assemble_L = lmax_limit
     _require_all_L(ckpts, assemble_L)
-
-    lmax_y_lim = lmax_y if lmax_limit is None else min(lmax_y, lmax_limit)
-    lmax_b_lim = lmax_b if lmax_limit is None else min(lmax_b, lmax_limit)
-    print(f"Assembling checkpoints up to L={assemble_L} (targets: lmax_out={lmax_out}, lmax_y={lmax_y}, lmax_b={lmax_b})...", flush=True)
+    lmax_y_lim = lmax_limit
+    lmax_b_lim = lmax_limit
+    print(f"Assembling checkpoints up to L={assemble_L} (lmax_out=lmax_y=lmax_b={lmax_limit})...", flush=True)
 
     # Merge tensors up to assemble_L / lmax limits
     idx_all: List[List[int]] = [[], [], [], [], [], []]
     vals_all: List[float] = []
-    shift_y = lmax_y - lmax_y_lim
-    shift_b = lmax_b - lmax_b_lim
+    t_start = time.perf_counter()
     for i, path in enumerate(ckpts, start=1):
-        meta = _load_meta(path)
-        start_L = int(meta.get("range_start_L", -1))
-        end_L = int(meta.get("range_end_L", -1))
-        if end_L < 0 or start_L > assemble_L:
+        L_val = int(path.stem.split("_L")[-1])
+        if L_val > assemble_L:
             continue
         if verbose:
-            print(f"[{i}/{total_ckpts}] Loading {path.name} (L range {start_L}-{end_L})...", flush=True)
+            print(f"[{i}/{total_ckpts}] Loading {path.name} (L={L_val})...", flush=True)
+        t0 = time.perf_counter()
         try:
             obj = torch.load(path, map_location="cpu", weights_only=True)
         except TypeError:
             obj = torch.load(path, map_location="cpu")
+        t_load = time.perf_counter() - t0
         G_sparse = obj["G_sparse"] if "G_sparse" in obj else obj["G"].to_sparse()
         G_sparse = G_sparse.coalesce()
         idx = G_sparse.indices()
         vals = G_sparse.values()
+        # Infer source lmax offsets from tensor shape to trim m indices
+        lmax_y_full = (G_sparse.shape[3] - 1) // 2
+        lmax_b_full = (G_sparse.shape[5] - 1) // 2
+        shift_y = lmax_y_full - lmax_y_lim
+        shift_b = lmax_b_full - lmax_b_lim
         mask = (
             (idx[0] <= assemble_L)
             & (idx[2] <= lmax_y_lim)
@@ -153,11 +90,14 @@ def assemble_in_memory(cache_dir: Path, lmax_limit: int | None = None, verbose: 
         for d in range(6):
             idx_all[d].extend(idx_f[d].tolist())
         vals_all.extend(vals_f.tolist())
-        print(
-            f"[{i}/{total_ckpts}] Added {added} entries from {path.name} "
-            f"(L range {meta.get('range_start_L', '?')}-{meta.get('range_end_L', '?')})",
-            flush=True,
-        )
+        if verbose:
+            t_done = time.perf_counter() - t0
+            print(
+                f"[{i}/{total_ckpts}] Added {added} entries from {path.name} "
+                f"(L={L_val}); "
+                f"load={t_load:.2f}s, total step={t_done:.2f}s; nnz so far={len(vals_all)}",
+                flush=True,
+            )
 
     if not vals_all:
         raise RuntimeError("No entries collected for assembled tensor.")
@@ -186,9 +126,9 @@ def assemble_in_memory(cache_dir: Path, lmax_limit: int | None = None, verbose: 
     meta_out = {
         "complete_L": assemble_L,
         "assembled_L": assemble_L,
-        "target_lmax_out": lmax_out,
-        "target_lmax_y": lmax_y,
-        "target_lmax_b": lmax_b,
+        "target_lmax_out": lmax_limit,
+        "target_lmax_y": lmax_limit,
+        "target_lmax_b": lmax_limit,
         "assembled_lmax_y": lmax_y_lim,
         "assembled_lmax_b": lmax_b_lim,
         "sparse": True,
