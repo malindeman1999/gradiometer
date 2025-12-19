@@ -15,8 +15,8 @@ from europa.gradient_utils import (
     spherical_components_to_cart,
     toroidal_field_spherical,
     toroidal_gradients_spherical,
-    toroidal_field_fd_gradients_spherical,
 )
+from europa import inductance
 
 
 def _err_stats(actual, expected):
@@ -59,10 +59,13 @@ def test_spherical_gradients_match_numeric():
     grad_true_normed = grad_true / 1e9
 
     # numeric spherical gradients via finite differencing on r/theta/phi by re-evaluating the field
-    grad_fd = toroidal_field_fd_gradients_spherical(
-        J,
-        R,
-        positions,
+    from europa.gradient_utils import finite_diff_gradients_spherical
+    Btor, Bpol, Brad = inductance.spectral_b_from_surface_currents(J, torch.zeros_like(J), radius=R)
+    grad_fd = finite_diff_gradients_spherical(
+        B_tor=Btor,
+        B_pol=Bpol,
+        B_rad=Brad,
+        positions=positions,
         delta_r=1e-4,
         delta_theta=1e-4,
         delta_phi=1e-4,

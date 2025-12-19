@@ -6,11 +6,18 @@ it is skipped. This avoids partial ranges and keeps bookkeeping simple.
 """
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 import numpy as np
 import torch
 
-from gaunt.gaunt_vectorized_wigxjpf import gaunt_coeff_vectorized_wigxjpf
+# Allow running this file directly (python gaunt/run_gaunt_calculator.py)
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from gaunt.helpers.gaunt_vectorized_wigxjpf import gaunt_coeff_vectorized_wigxjpf
 
 # Target settings (symmetric)
 LMAX = 50

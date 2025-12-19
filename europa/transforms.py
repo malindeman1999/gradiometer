@@ -39,7 +39,8 @@ def _get_scalar_matrices(positions: torch.Tensor, lmax: int, weights: torch.Tens
     pinv = np.linalg.pinv(Y_w)
     Y_w_torch = torch.from_numpy(Y_w).to(device=positions.device)
     pinv_torch = torch.from_numpy(pinv).to(device=positions.device)
-    W_sqrt_torch = torch.from_numpy(W_sqrt.squeeze()).to(device=positions.device, dtype=torch.float64)
+    # Preserve a 1D shape even for a single node (avoids scalar squeeze issues downstream).
+    W_sqrt_torch = torch.from_numpy(W_sqrt.reshape(-1)).to(device=positions.device, dtype=torch.float64)
     return Y_w_torch, pinv_torch, W_sqrt_torch
 
 

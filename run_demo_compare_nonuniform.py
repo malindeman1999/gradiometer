@@ -58,7 +58,7 @@ def _clone_ps(base: PhasorSimulation) -> PhasorSimulation:
 def run(compute_gradients: bool = False) -> Tuple[PhasorSimulation, PhasorSimulation, str, int, bool]:
     # Grid and driver
     # Increase spatial resolution (double nside) and allow higher spectral order
-    lmax_target = 10
+    lmax_target = 3
     grid_cfg = GridConfig(nside=32, lmax=lmax_target, radius_m=1.56e6, device="cpu")
     _log(f"Building grid with nside={grid_cfg.nside}, lmax={grid_cfg.lmax}...")
     ambient_cfg, B_radial_spec, period_sec = build_ambient_driver_x(grid_cfg)

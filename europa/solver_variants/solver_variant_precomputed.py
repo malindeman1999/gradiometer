@@ -23,7 +23,7 @@ from europa.solvers import (
     toroidal_e_from_radial_b,
 )
 from phasor_data import PhasorSimulation
-from gaunt.gaunt_cache_wigxjpf import load_gaunt_tensor_wigxjpf
+from gaunt.assemble_gaunt_checkpoints import assemble_in_memory
 
 
 def _all_lm(lmax: int) -> list[tuple[int, int]]:
@@ -182,13 +182,13 @@ def solve_spectral_self_consistent_sim_precomputed(
 
     if mixing_matrix is None:
         if gaunt_sparse is None:
-            print("Loading dense Gaunt tensor from cache and building mixing matrix...", flush=True)
-            G = load_gaunt_tensor_wigxjpf(lmax_out=lmax, lmax_y=lmax, lmax_b=lmax, cache_dir=cache_dir)
-            M = _build_mixing_matrix_precomputed(lmax, omega0, sim.radius_m, Y_s_spectral, G)
+            print("Assembling Gaunt tensor from checkpoints and building mixing matrix (sparse)...", flush=True)
+            G_sparse, _ = assemble_in_memory(cache_dir=Path(cache_dir), lmax_limit=lmax, verbose=True)
         else:
             print("Building mixing matrix from provided sparse Gaunt tensor...", flush=True)
-            G = _trim_gaunt_sparse(gaunt_sparse, lmax_out=lmax, lmax_y=lmax, lmax_b=lmax)
-            M = _build_mixing_matrix_precomputed_sparse(lmax, omega0, sim.radius_m, Y_s_spectral, G)
+            G_sparse = gaunt_sparse
+        G_trim = _trim_gaunt_sparse(G_sparse, lmax_out=lmax, lmax_y=lmax, lmax_b=lmax)
+        M = _build_mixing_matrix_precomputed_sparse(lmax, omega0, sim.radius_m, Y_s_spectral, G_trim)
     else:
         print("Using provided mixing matrix (skipping Gaunt build)...", flush=True)
         M = mixing_matrix

@@ -1,13 +1,15 @@
-"""
+﻿"""
 Helpers for evaluating emitted-field gradients at arbitrary radii.
-Uses simple finite differences on Cartesian axes; a higher-order stencil would
-improve accuracy at additional cost.
+
+Key notes:
+- finite_diff_gradients_cartesian_closed_form(): central differences on Cartesian axes using closed-form toroidal field.
+- finite_diff_gradients_spherical(): central differences in (r, theta, phi) using closed-form toroidal field with angular derivatives scaled to per-meter via 1/r and 1/(r sin theta).
 """
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 import warnings
+import math
 
 import torch
 
@@ -20,10 +22,6 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 def _cart_to_sph_components(B_cart: torch.Tensor, theta: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
-    """
-    Project Cartesian B vectors to spherical components (B_r, B_theta, B_phi) using the local basis
-    defined by (theta, phi). Shapes: B_cart [..., 3]; theta/phi broadcastable to B_cart.
-    """
     sin_theta = torch.sin(theta)
     cos_theta = torch.cos(theta)
     sin_phi = torch.sin(phi)
@@ -38,7 +36,6 @@ def _cart_to_sph_components(B_cart: torch.Tensor, theta: torch.Tensor, phi: torc
 
 
 def _sph_to_cart_coords(r: torch.Tensor, theta: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
-    """Convert spherical coordinates to Cartesian positions."""
     sin_t = torch.sin(theta)
     cos_t = torch.cos(theta)
     sin_p = torch.sin(phi)
@@ -50,12 +47,10 @@ def _sph_to_cart_coords(r: torch.Tensor, theta: torch.Tensor, phi: torch.Tensor)
 
 
 def sph_to_cart_coords(r: torch.Tensor, theta: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
-    """Public helper: convert spherical coordinates to Cartesian positions."""
     return _sph_to_cart_coords(r, theta, phi)
 
 
 def _cart_basis(positions: torch.Tensor):
-    """Unit vectors (r̂, θ̂, φ̂) at each Cartesian position."""
     r = torch.linalg.norm(positions, dim=-1, keepdim=True)
     r_safe = torch.where(r == 0, torch.full_like(r, 1e-30), r)
     rhat = positions / r_safe
@@ -70,22 +65,11 @@ def _cart_basis(positions: torch.Tensor):
 
 
 def spherical_components_to_cart(Br: torch.Tensor, Btheta: torch.Tensor, Bphi: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-    """Transform spherical B components at given positions into Cartesian components."""
     rhat, theta_hat, phi_hat = _cart_basis(positions)
     return Br[..., None] * rhat + Btheta[..., None] * theta_hat + Bphi[..., None] * phi_hat
 
 
 def _sph_harm_with_derivs(positions: torch.Tensor, lmax: int, eps: float = 1e-6):
-    """
-    Compute Y_lm and its first/second theta derivatives for all positions (NumPy/CPU).
-    TODO: Replace with a torch-native spherical harmonics implementation to enable end-to-end GPU execution.
-    Returns numpy arrays:
-        theta, phi: [N]
-        sin_theta: [N]
-        Y: [N, lmax+1, 2*lmax+1] (complex)
-        dY_dtheta: same shape
-        d2Y_dtheta2: same shape
-    """
     import numpy as np
 
     pos_np = positions.detach().cpu().numpy()
@@ -93,13 +77,10 @@ def _sph_harm_with_derivs(positions: torch.Tensor, lmax: int, eps: float = 1e-6)
     r = np.linalg.norm(pos_np, axis=1) + 1e-12
     theta = np.arccos(np.clip(z / r, -1.0, 1.0))
     phi = np.mod(np.arctan2(y, x), 2 * np.pi)
-    sin_theta = np.sin(theta)
-
     n = pos_np.shape[0]
     Y = np.zeros((lmax + 1, 2 * lmax + 1, n), dtype=np.complex128)
     dY = np.zeros_like(Y)
     d2Y = np.zeros_like(Y)
-
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=DeprecationWarning, message="`scipy.special.sph_harm` is deprecated")
         for l in range(lmax + 1):
@@ -113,26 +94,18 @@ def _sph_harm_with_derivs(positions: torch.Tensor, lmax: int, eps: float = 1e-6)
                 Y[l, lmax - l + idx] = base
                 dY[l, lmax - l + idx] = dtheta
                 d2Y[l, lmax - l + idx] = d2theta
-
-    # Reorder to [N, l, m] for easier broadcasting with point dimension first
     Y_np = np.transpose(Y, (2, 0, 1))
     dY_np = np.transpose(dY, (2, 0, 1))
     d2Y_np = np.transpose(d2Y, (2, 0, 1))
-    return theta, phi, sin_theta, Y_np, dY_np, d2Y_np
+    return theta, phi, np.sin(theta), Y_np, dY_np, d2Y_np
 
 
-def finite_diff_gradients(
-    B_tor: torch.Tensor,
-    B_pol: torch.Tensor,
-    B_rad: torch.Tensor,
-    positions: torch.Tensor,
-    delta: float = 1.0,
+def finite_diff_gradients_cartesian_closed_form(
+    J_tor: torch.Tensor, radius: float, positions: torch.Tensor, delta: float = 1.0
 ) -> torch.Tensor:
     """
-    Finite-difference gradients of B by evaluating the field at +/- delta along Cartesian axes.
-    Uses a simple central difference; a fully symmetric higher-order stencil would be more accurate
-    but more expensive, and at meter-scale steps this approximation should be adequate.
-    Returns [N, 3, 3] with dB_i/dx_j in Cartesian coordinates.
+    Cartesian finite differences using the closed-form toroidal field evaluator.
+    Returns [N,3,3] with dB_i/dx_j in Cartesian coordinates.
     """
     device = positions.device
     dtype = positions.dtype
@@ -142,73 +115,64 @@ def finite_diff_gradients(
         shift = deltas[axis]
         pos_plus = positions + shift
         pos_minus = positions - shift
-        B_plus = evaluate_field_from_spectral(B_tor, B_pol, B_rad, pos_plus)
-        B_minus = evaluate_field_from_spectral(B_tor, B_pol, B_rad, pos_minus)
-        grad_axis = (B_plus - B_minus) / (2.0 * delta)
+        Br_p, Bth_p, Bph_p = toroidal_field_spherical(J_tor, radius, pos_plus)
+        Br_m, Bth_m, Bph_m = toroidal_field_spherical(J_tor, radius, pos_minus)
+        Bp_cart = spherical_components_to_cart(Br_p, Bth_p, Bph_p, pos_plus)
+        Bm_cart = spherical_components_to_cart(Br_m, Bth_m, Bph_m, pos_minus)
+        grad_axis = (Bp_cart - Bm_cart) / (2.0 * delta)
         grads.append(grad_axis)
-    grad_tensor = torch.stack(grads, dim=-1)  # [N,3,3] with last dim = axis
-    return grad_tensor
+    return torch.stack(grads, dim=-1)  # [N,3,3]
 
 
 def finite_diff_gradients_spherical(
-    B_tor: torch.Tensor,
-    B_pol: torch.Tensor,
-    B_rad: torch.Tensor,
+    J_tor: torch.Tensor,
+    radius: float,
     positions: torch.Tensor,
     delta_r: float = 1.0,
     delta_theta: float = 1e-3,
     delta_phi: float = 1e-3,
 ) -> torch.Tensor:
     """
-    Finite-difference gradients of B in spherical coordinates (r, theta, phi).
-    Returns [N, 3, 3] with partials of (B_r, B_theta, B_phi) w.r.t (r, theta, phi).
-    Perturbations: radial step delta_r (meters), angular steps delta_theta/delta_phi (radians).
+    Finite-difference gradients in spherical coordinates using closed-form toroidal field.
+    Returns [N,3,3] with components [d/dr, (1/r)d/dtheta, (1/(r sin theta))d/dphi].
     """
     device = positions.device
     dtype = positions.dtype
-    # Spherical coords of base positions
     r = torch.linalg.norm(positions, dim=-1)
     r_safe = torch.where(r == 0, torch.ones_like(r), r)
     theta = torch.acos(torch.clamp(positions[:, 2] / r_safe, -1.0, 1.0))
     phi = torch.atan2(positions[:, 1], positions[:, 0])
 
-    def _to_cart(r_val, theta_val, phi_val):
-        sin_t = torch.sin(theta_val)
-        cos_t = torch.cos(theta_val)
-        sin_p = torch.sin(phi_val)
-        cos_p = torch.cos(phi_val)
-        return torch.stack([r_val * sin_t * cos_p, r_val * sin_t * sin_p, r_val * cos_t], dim=-1)
-
     grads = []
-    # Perturbations for r, theta, phi
-    shifts = [
-        (delta_r, 0.0, 0.0),
-        (0.0, delta_theta, 0.0),
-        (0.0, 0.0, delta_phi),
-    ]
-    for dr, dt, dp in shifts:
-        r_plus = r + dr
-        r_minus = r - dr
-        theta_plus = theta + dt
-        theta_minus = theta - dt
-        phi_plus = phi + dp
-        phi_minus = phi - dp
 
-        pos_plus = _to_cart(r_plus, theta_plus, phi_plus).to(device=device, dtype=dtype)
-        pos_minus = _to_cart(r_minus, theta_minus, phi_minus).to(device=device, dtype=dtype)
+    # d/dr
+    pos_plus = _sph_to_cart_coords(r + delta_r, theta, phi).to(device=device, dtype=dtype)
+    pos_minus = _sph_to_cart_coords(r - delta_r, theta, phi).to(device=device, dtype=dtype)
+    Br_p, Bth_p, Bph_p = toroidal_field_spherical(J_tor, radius, pos_plus)
+    Br_m, Bth_m, Bph_m = toroidal_field_spherical(J_tor, radius, pos_minus)
+    grads.append((torch.stack([Br_p, Bth_p, Bph_p], dim=-1) - torch.stack([Br_m, Bth_m, Bph_m], dim=-1)) / (2.0 * delta_r))
 
-        B_plus_cart = evaluate_field_from_spectral(B_tor, B_pol, B_rad, pos_plus)
-        B_minus_cart = evaluate_field_from_spectral(B_tor, B_pol, B_rad, pos_minus)
+    # d/dtheta -> per-meter
+    pos_plus = _sph_to_cart_coords(r, theta + delta_theta, phi).to(device=device, dtype=dtype)
+    pos_minus = _sph_to_cart_coords(r, theta - delta_theta, phi).to(device=device, dtype=dtype)
+    Br_p, Bth_p, Bph_p = toroidal_field_spherical(J_tor, radius, pos_plus)
+    Br_m, Bth_m, Bph_m = toroidal_field_spherical(J_tor, radius, pos_minus)
+    grad_theta = (torch.stack([Br_p, Bth_p, Bph_p], dim=-1) - torch.stack([Br_m, Bth_m, Bph_m], dim=-1)) / (2.0 * delta_theta)
+    grad_theta = grad_theta / r_safe[..., None]
+    grads.append(grad_theta)
 
-        B_plus_sph = _cart_to_sph_components(B_plus_cart, theta_plus, phi_plus)
-        B_minus_sph = _cart_to_sph_components(B_minus_cart, theta_minus, phi_minus)
+    # d/dphi -> per-meter
+    pos_plus = _sph_to_cart_coords(r, theta, phi + delta_phi).to(device=device, dtype=dtype)
+    pos_minus = _sph_to_cart_coords(r, theta, phi - delta_phi).to(device=device, dtype=dtype)
+    Br_p, Bth_p, Bph_p = toroidal_field_spherical(J_tor, radius, pos_plus)
+    Br_m, Bth_m, Bph_m = toroidal_field_spherical(J_tor, radius, pos_minus)
+    grad_phi = (torch.stack([Br_p, Bth_p, Bph_p], dim=-1) - torch.stack([Br_m, Bth_m, Bph_m], dim=-1)) / (2.0 * delta_phi)
+    sin_theta = torch.sin(theta)
+    sin_theta_safe = torch.where(sin_theta == 0, torch.full_like(sin_theta, 1e-30), sin_theta)
+    grad_phi = grad_phi / (r_safe[..., None] * sin_theta_safe[..., None])
+    grads.append(grad_phi)
 
-        step = dr if dr != 0 else dt if dt != 0 else dp
-        grad_axis = (B_plus_sph - B_minus_sph) / (2.0 * step)
-        grads.append(grad_axis)
-
-    grad_tensor = torch.stack(grads, dim=-1)  # [N,3,3] components x (r,theta,phi)
-    return grad_tensor
+    return torch.stack(grads, dim=-1)  # [N,3,3]
 
 
 def _toroidal_field_and_gradients_spherical_core(
@@ -217,13 +181,6 @@ def _toroidal_field_and_gradients_spherical_core(
     positions: torch.Tensor,
     theta_fd_step: float = 1e-6,
 ):
-    """
-    Analytic spherical components and gradients for toroidal surface currents (MQS exterior).
-    NOTE: This implementation is NumPy/SciPy-backed. TODO: provide a torch-native spherical harmonic path
-    to enable GPU execution end-to-end.
-    Returns (B_r, B_theta, B_phi, grad_Br, grad_Btheta, grad_Bphi), with gradients expressed
-    as [dr f, (1/r) dtheta f, (1/(r sin(theta))) dphi f].
-    """
     import numpy as np
 
     device = positions.device
@@ -231,7 +188,6 @@ def _toroidal_field_and_gradients_spherical_core(
     if J_tor.shape[-1] != 2 * lmax + 1:
         raise ValueError(f"Expected J_tor shape (lmax+1, 2*lmax+1); got {tuple(J_tor.shape)}")
 
-    # Positions to numpy
     pos_np = positions.detach().cpu().numpy()
     r = np.linalg.norm(pos_np, axis=1)
     r_safe = np.where(r == 0.0, 1e-30, r)
@@ -241,67 +197,46 @@ def _toroidal_field_and_gradients_spherical_core(
     sin_th_safe = np.where(sin_th == 0.0, 1e-30, sin_th)
     cos_th = np.cos(theta)
 
-    # Harmonics and theta derivatives at points (shapes: [N, l, m])
     _, _, _, Y, dY, d2Y = _sph_harm_with_derivs(positions, lmax, eps=theta_fd_step)
 
-    # Broadcast grids for l and m
     ls = np.arange(0, lmax + 1, dtype=np.float64).reshape(1, lmax + 1, 1)
     ms = np.arange(-lmax, lmax + 1, dtype=np.float64).reshape(1, 1, 2 * lmax + 1)
 
-    # Radial factor F_l(r) = (R/r)^(l+2)
     R = float(radius)
     r_ratio = (R / r_safe).reshape(-1, 1, 1)
-    F_lm = np.power(r_ratio, ls + 2.0)  # [N, l, m] via broadcast below
+    F_lm = np.power(r_ratio, ls + 2.0)
     F_lm = np.broadcast_to(F_lm, (r.shape[0], lmax + 1, 2 * lmax + 1)).astype(np.complex128)
 
     MU0_val = float(inductance.MU0)
     ell = ls * (ls + 1.0)
     two_l1 = 2.0 * ls + 1.0
     ell_safe = np.where(ell == 0.0, 1.0, ell)
+
     A_l = (-MU0_val / (two_l1 * ell_safe)).astype(np.complex128)
     C_l = (MU0_val * ls / two_l1).astype(np.complex128)
     A_lm = np.broadcast_to(A_l, (r.shape[0], lmax + 1, 2 * lmax + 1))
     C_lm = np.broadcast_to(C_l, (r.shape[0], lmax + 1, 2 * lmax + 1))
 
     J = np.asarray(J_tor.detach().cpu().numpy(), dtype=np.complex128)
-    J_lm = np.broadcast_to(J, (r.shape[0],) + J.shape)  # [N,l,m]
+    J_lm = np.broadcast_to(J, (r.shape[0],) + J.shape)
 
-    # Field components
     Br = np.sum(A_lm * J_lm * F_lm * Y, axis=(-2, -1))
     Btheta = np.sum(C_lm * J_lm * F_lm * dY, axis=(-2, -1))
     im_over_sin = 1j * ms / sin_th_safe[:, None, None]
     Bphi = np.sum(C_lm * J_lm * F_lm * (im_over_sin * Y), axis=(-2, -1))
 
-    # Radial derivative of F_l
     dF_dr = (-(ls + 2.0) / r_safe[:, None, None]) * F_lm
 
-    # grad Br
     dBr_dr = np.sum(A_lm * J_lm * dF_dr * Y, axis=(-2, -1))
     dBr_dth = np.sum(A_lm * J_lm * F_lm * dY, axis=(-2, -1))
     dBr_dph = np.sum(A_lm * J_lm * F_lm * (1j * ms * Y), axis=(-2, -1))
-    grad_Br = np.stack(
-        [
-            dBr_dr,
-            dBr_dth / r_safe,
-            dBr_dph / (r_safe * sin_th_safe),
-        ],
-        axis=-1,
-    )
+    grad_Br = np.stack([dBr_dr, dBr_dth / r_safe, dBr_dph / (r_safe * sin_th_safe)], axis=-1)
 
-    # grad Btheta
     dBth_dr = np.sum(C_lm * J_lm * dF_dr * dY, axis=(-2, -1))
     dBth_dth = np.sum(C_lm * J_lm * F_lm * d2Y, axis=(-2, -1))
     dBth_dph = np.sum(C_lm * J_lm * F_lm * (1j * ms * dY), axis=(-2, -1))
-    grad_Btheta = np.stack(
-        [
-            dBth_dr,
-            dBth_dth / r_safe,
-            dBth_dph / (r_safe * sin_th_safe),
-        ],
-        axis=-1,
-    )
+    grad_Btheta = np.stack([dBth_dr, dBth_dth / r_safe, dBth_dph / (r_safe * sin_th_safe)], axis=-1)
 
-    # grad Bphi
     term_theta = (1.0 / sin_th_safe)[:, None, None] * dY - (cos_th / (sin_th_safe ** 2))[:, None, None] * Y
     d_dth_im_over_sin_Y = (1j * ms) * term_theta
     m2_over_sin = (-(ms * ms) / sin_th_safe[:, None, None])
@@ -309,16 +244,8 @@ def _toroidal_field_and_gradients_spherical_core(
     dBph_dr = np.sum(C_lm * J_lm * dF_dr * (im_over_sin * Y), axis=(-2, -1))
     dBph_dth = np.sum(C_lm * J_lm * F_lm * d_dth_im_over_sin_Y, axis=(-2, -1))
     dBph_dph = np.sum(C_lm * J_lm * F_lm * (m2_over_sin * Y), axis=(-2, -1))
-    grad_Bphi = np.stack(
-        [
-            dBph_dr,
-            dBph_dth / r_safe,
-            dBph_dph / (r_safe * sin_th_safe),
-        ],
-        axis=-1,
-    )
+    grad_Bphi = np.stack([dBph_dr, dBph_dth / r_safe, dBph_dph / (r_safe * sin_th_safe)], axis=-1)
 
-    # Convert results back to torch on the original device
     def _to_tensor(arr):
         return torch.as_tensor(arr, device=device, dtype=torch.complex128)
 
@@ -338,9 +265,6 @@ def toroidal_field_spherical(
     positions: torch.Tensor,
     theta_fd_step: float = 1e-6,
 ):
-    """
-    Analytic spherical components (B_r, B_theta, B_phi) for toroidal surface currents (MQS exterior).
-    """
     Br, Btheta, Bphi, *_ = _toroidal_field_and_gradients_spherical_core(J_tor, radius, positions, theta_fd_step)
     return Br, Btheta, Bphi
 
@@ -351,10 +275,6 @@ def toroidal_gradients_spherical(
     positions: torch.Tensor,
     theta_fd_step: float = 1e-6,
 ):
-    """
-    Analytic spherical gradients (∂/∂r, (1/r)∂/∂θ, (1/(r sinθ))∂/∂φ) of the toroidal field components.
-    Returns grad_Br, grad_Btheta, grad_Bphi stacked as [..., 3].
-    """
     *_, grad_Br, grad_Btheta, grad_Bphi = _toroidal_field_and_gradients_spherical_core(
         J_tor, radius, positions, theta_fd_step
     )
@@ -367,74 +287,14 @@ def toroidal_field_and_gradients_spherical(
     positions: torch.Tensor,
     theta_fd_step: float = 1e-6,
 ):
-    """
-    Analytic spherical components and gradients for toroidal surface currents (MQS exterior).
-    Returns (B_r, B_theta, B_phi, grad_Br, grad_Btheta, grad_Bphi), with gradients expressed
-    as [dr f, (1/r) dtheta f, (1/(r sin(theta))) dphi f].
-    """
     return _toroidal_field_and_gradients_spherical_core(J_tor, radius, positions, theta_fd_step)
 
 
-def toroidal_field_fd_gradients_spherical(
-    J_tor: torch.Tensor,
-    radius: float,
-    positions: torch.Tensor,
-    delta_r: float = 1e-4,
-    delta_theta: float = 1e-4,
-    delta_phi: float = 1e-4,
-) -> torch.Tensor:
-    """
-    Finite-difference spherical gradients of the toroidal field by re-evaluating the closed-form field.
-    Returns [N,3,3] with partials of (B_r, B_theta, B_phi) w.r.t (r, theta, phi).
-    """
-    device = positions.device
-    dtype = positions.dtype
-
-    r = torch.linalg.norm(positions, dim=-1)
-    r_safe = torch.where(r == 0, torch.full_like(r, 1e-30), r)
-    theta = torch.acos(torch.clamp(positions[:, 2] / r_safe, -1.0, 1.0))
-    phi = torch.atan2(positions[:, 1], positions[:, 0])
-
-    deltas = (delta_r, delta_theta, delta_phi)
-    grads_fd = []
-    for axis, delta in enumerate(deltas):
-        r_plus = r + (delta if axis == 0 else 0.0)
-        r_minus = r - (delta if axis == 0 else 0.0)
-        theta_plus = theta + (delta if axis == 1 else 0.0)
-        theta_minus = theta - (delta if axis == 1 else 0.0)
-        phi_plus = phi + (delta if axis == 2 else 0.0)
-        phi_minus = phi - (delta if axis == 2 else 0.0)
-
-        pos_plus = _sph_to_cart_coords(r_plus, theta_plus, phi_plus).to(device=device, dtype=dtype)
-        pos_minus = _sph_to_cart_coords(r_minus, theta_minus, phi_minus).to(device=device, dtype=dtype)
-
-        Br_p, Bth_p, Bph_p = toroidal_field_spherical(J_tor, radius, pos_plus)
-        Br_m, Bth_m, Bph_m = toroidal_field_spherical(J_tor, radius, pos_minus)
-
-        grad_axis = torch.stack(
-            [
-                (Br_p - Br_m) / (2 * delta),
-                (Bth_p - Bth_m) / (2 * delta),
-                (Bph_p - Bph_m) / (2 * delta),
-            ],
-            dim=-1,
-        )
-        grads_fd.append(grad_axis)
-
-    grad_tensor = torch.stack(grads_fd, dim=-2)  # [N,3,3] d(component)/d(r,theta,phi)
-    return grad_tensor
-
-
 def rss_gradient_from_emit(sim: "PhasorSimulation", positions: torch.Tensor, obs_radius: float | None = None) -> torch.Tensor:
-    """
-    Compute RSS of emitted B-field gradient (|∇B|) at specified positions using the analytic
-    toroidal field gradients (no additional differentiation).
-    """
     obs_r = sim.radius_m if obs_radius is None else float(obs_radius)
     K_tor = sim.K_toroidal
     if K_tor is None:
         raise ValueError("K_toroidal is required to evaluate emitted field at new radius.")
-    # Gradients returned as [dr f, (1/r) dtheta f, (1/(r sin(theta))) dphi f]
     _, _, _, grad_Br, grad_Btheta, grad_Bphi = toroidal_field_and_gradients_spherical(
         K_tor, radius=obs_r, positions=positions
     )
@@ -442,8 +302,130 @@ def rss_gradient_from_emit(sim: "PhasorSimulation", positions: torch.Tensor, obs
     return torch.linalg.norm(grad_tensor, dim=(1, 2))
 
 
+def rss_gradient_cartesian_autograd(J_tor: torch.Tensor, radius: float, positions: torch.Tensor) -> torch.Tensor:
+    B_tor, B_pol, B_rad = inductance.spectral_b_from_surface_currents(J_tor, torch.zeros_like(J_tor), radius=radius)
+    pos = positions.detach().requires_grad_(True)
+    B_cart = evaluate_field_from_spectral(B_tor, B_pol, B_rad, pos)
+    grads = []
+    for comp in range(3):
+        g_real = torch.autograd.grad(B_cart[:, comp].real.sum(), pos, retain_graph=True)[0]
+        g_imag = torch.autograd.grad(B_cart[:, comp].imag.sum(), pos, retain_graph=True)[0]
+        grads.append(g_real + 1j * g_imag)
+    grad_tensor = torch.stack(grads, dim=1)
+    return torch.linalg.norm(grad_tensor, dim=(1, 2))
+
+
+def gradient_sanity_check(
+    sim: "PhasorSimulation",
+    altitude_m: float = 0.0,
+    n_points: int = 24,
+    seed: int | None = 0,
+    delta_cart_m: float = 0.25,
+    delta_r: float = 1e-4,
+    delta_theta: float = 1e-4,
+    delta_phi: float = 1e-4,
+    theta_fd_step: float = 1e-6,
+    device: str | None = None,
+    verbose: bool = True,
+    use_autograd: bool = False,
+):
+    if sim.K_toroidal is None:
+        raise ValueError("sim.K_toroidal is required for this sanity check.")
+    if device is None:
+        device = sim.grid_positions.device if hasattr(sim, "grid_positions") else "cpu"
+    if seed is not None:
+        torch.manual_seed(seed)
+    eps = torch.as_tensor(1e-30, device=device, dtype=torch.float64)
+
+    u = torch.rand(n_points, device=device, dtype=torch.float64)
+    v = torch.rand(n_points, device=device, dtype=torch.float64)
+    theta = torch.acos(2.0 * u - 1.0)
+    phi = 2.0 * torch.pi * v
+    r_obs = float(sim.radius_m + altitude_m)
+    positions = sph_to_cart_coords(
+        torch.full((n_points,), r_obs, device=device, dtype=torch.float64),
+        theta,
+        phi,
+    )
+
+    R_source = float(sim.radius_m)
+    J_tor = sim.K_toroidal.to(device=device)
+
+    _, _, _, grad_Br, grad_Btheta, grad_Bphi = toroidal_field_and_gradients_spherical(
+        J_tor, radius=R_source, positions=positions, theta_fd_step=theta_fd_step
+    )
+    rss_A = torch.linalg.norm(torch.stack([grad_Br, grad_Btheta, grad_Bphi], dim=1), dim=(1, 2))
+
+    grad_sph_fd = finite_diff_gradients_spherical(
+        J_tor, R_source, positions, delta_r=delta_r, delta_theta=delta_theta, delta_phi=delta_phi
+    )
+    rss_B = torch.linalg.norm(grad_sph_fd, dim=(1, 2))
+
+    grad_cart_fd = finite_diff_gradients_cartesian_closed_form(J_tor, R_source, positions, delta=delta_cart_m)
+    rss_cart_fd = torch.linalg.norm(grad_cart_fd, dim=(1, 2))
+
+    rss_C = None
+    rel_BC_cart = None
+    if use_autograd:
+        rss_C = rss_gradient_cartesian_autograd(J_tor, radius=R_source, positions=positions)
+        rel_BC_cart = torch.abs(rss_cart_fd - rss_C) / torch.maximum(torch.abs(rss_C), eps)
+
+    rel_AB = torch.abs(rss_A - rss_B) / torch.maximum(torch.abs(rss_B), eps)
+
+    def _summary(x: torch.Tensor):
+        x = x.detach().cpu()
+        return {
+            "min": float(x.min()),
+            "median": float(x.median()),
+            "mean": float(x.mean()),
+            "max": float(x.max()),
+        }
+
+    out = {
+        "rss_A_analytic_spherical": rss_A.detach().cpu(),
+        "rss_B_fd_spherical": rss_B.detach().cpu(),
+        "rss_fd_cartesian": rss_cart_fd.detach().cpu(),
+        "rss_C_autograd_cartesian": rss_C.detach().cpu() if rss_C is not None else None,
+        "rel_AB_vs_B": rel_AB.detach().cpu(),
+        "rel_BC_cart_vs_C": rel_BC_cart.detach().cpu() if rel_BC_cart is not None else None,
+        "summary": {
+            "rel_AB_vs_B": _summary(rel_AB),
+            "rel_BC_cart_vs_C": _summary(rel_BC_cart) if rel_BC_cart is not None else None,
+        },
+        "params": {
+            "altitude_m": float(altitude_m),
+            "n_points": int(n_points),
+            "seed": None if seed is None else int(seed),
+            "delta_cart_m": float(delta_cart_m),
+            "delta_r": float(delta_r),
+            "delta_theta": float(delta_theta),
+            "delta_phi": float(delta_phi),
+            "theta_fd_step": float(theta_fd_step),
+            "R_source_m": float(R_source),
+            "r_obs_m": float(r_obs),
+            "device": str(device),
+        },
+        "positions_cart": positions.detach().cpu(),
+        "positions_sph": {
+            "r": torch.full((n_points,), r_obs, device=device, dtype=torch.float64).detach().cpu(),
+            "theta": theta.detach().cpu(),
+            "phi": phi.detach().cpu(),
+        },
+    }
+
+    if verbose:
+        print("\n=== Gradient sanity check ===")
+        for k, v in out["params"].items():
+            print(f"{k}: {v}")
+        print("\nRelative errors (RSS gradients):")
+        print("A vs B (relative to B):", out["summary"]["rel_AB_vs_B"])
+        if rel_BC_cart is not None:
+            print("FD Cartesian vs autograd Cartesian:", out["summary"]["rel_BC_cart_vs_C"])
+
+    return out
+
+
 def render_gradient_map(sim: "PhasorSimulation", altitude_m: float, subdivisions: int, save_path: str, title: str) -> None:
-    """Render a sphere heat map of RSS(|∇B_emit|) at a given altitude."""
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -452,10 +434,12 @@ def render_gradient_map(sim: "PhasorSimulation", altitude_m: float, subdivisions
     radius = sim.radius_m + altitude_m
     scale = radius / sim.radius_m
     positions = (sim.grid_positions * scale).to(dtype=torch.float64)
+
     rss = rss_gradient_from_emit(sim, positions, obs_radius=radius)
 
     vertices, faces, centers = _build_mesh(radius, subdivisions=subdivisions, stride=1)
     positions = positions.to(dtype=centers.dtype)
+
     dists = torch.cdist(centers, positions)
     nearest = dists.argmin(dim=1)
     face_vals = rss[nearest].cpu().numpy()
