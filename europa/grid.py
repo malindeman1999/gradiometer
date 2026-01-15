@@ -46,13 +46,22 @@ def make_grid(config: GridConfig) -> Grid:
     Positions are face centers; neighbors are adjacent faces (up to 3, padded with self).
     """
     def _subdivisions_from_nside(n: int) -> int:
-        # Map HEALPix-like nside to icosphere subdivisions by matching face count roughly:
-        # target_faces ~ 12 * nside^2 (HEALPix). Icosphere faces ~ 20 * 4^subdiv.
-        # solve for subdiv: 4^s ~ 0.6 * n^2 -> s ~ log2(n) + 0.5*log2(0.6).
+        """
+        Choose subdivision level whose face count (20*4^s) best matches a target proportional to nside.
+        Here we treat nside as a rough face-count proxy (target_faces ≈ 2*nside) rather than HEALPix nside^2.
+        """
         if n <= 0:
             return 0
-        raw = math.log2(n) + 0.5 * math.log2(0.6)
-        return max(0, min(8, int(round(raw))))
+        target = max(20, 2 * n)
+        best_s = 0
+        best_err = float("inf")
+        for s in range(0, 9):  # 0..8
+            faces = 20 * (4 ** s)
+            err = abs(faces - target)
+            if err < best_err:
+                best_err = err
+                best_s = s
+        return best_s
 
     subdivisions = _subdivisions_from_nside(config.nside)
     surface_sigma = float(config.seawater_conductivity_s_per_m * config.ocean_thickness_m)

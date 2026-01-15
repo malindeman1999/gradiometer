@@ -10,7 +10,7 @@ class GridConfig:
     radius_m: float = 1.0  # sphere radius (Europa radius in meters for scaling)
     ocean_thickness_m: float = 100_000.0  # shell thickness to convert 3D to 2D conductivity (default 100 km)
     # ocean_thickness_m: float = 10.0  # NOT PHYSICAL, FOR DEBUGGING ONLY
-    seawater_conductivity_s_per_m: float = 3.3  # bulk seawater conductivity (S/m)
+    seawater_conductivity_s_per_m: float = 0.3  # Europa ocean bulk conductivity (S/m)
     device: str = "cuda"  # target device: "cuda" or "cpu"
 
 

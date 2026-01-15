@@ -92,7 +92,7 @@ def sh_inverse(coeffs: torch.Tensor, positions: torch.Tensor, weights: torch.Ten
     n_nodes = positions.shape[0]
     coeffs_flat = _unpad_coeffs(coeffs)
     coeffs_flat = coeffs_flat.to(dtype=Y_w.dtype)
-    recon_w = coeffs_flat @ torch.conj(Y_w.T)
+    recon_w = coeffs_flat @ Y_w.T
     recon = recon_w / w_sqrt[None, :].to(dtype=recon_w.dtype)
     return recon.reshape(coeffs.shape[:-2] + (n_nodes,))
 

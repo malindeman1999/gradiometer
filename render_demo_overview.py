@@ -4,7 +4,7 @@ phasor sphere maps on the right for each quantity. Outputs two figures
 (3 rows each) covering six quantities.
 """
 import argparse
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from phasor_data import PhasorSimulation
 from plot_demo_harmonics import _flatten as _flatten_lm
 from render_phasor_maps import _build_mesh, _scalar_from_sh, _toroidal_vec_mag
+from europa import transforms
 
 
 def render_demo_overview(
@@ -26,6 +27,7 @@ def render_demo_overview(
     save_path: Optional[str] = "demo_currents_overview.png",
     show: bool = True,
     eps: float = 1e-15,
+    grid_state_path: Optional[str] = None,
 ) -> None:
     raw = torch.load(data_path, map_location="cpu", weights_only=False)
     sim = PhasorSimulation.from_saved(raw)
@@ -77,10 +79,16 @@ def render_demo_overview(
     # Sphere data
     vertices, faces, centers = _build_mesh(radius, subdivisions=subdivisions, stride=max(1, stride))
     tri_verts = vertices[faces].cpu().numpy()
+    grid_state = None
+    if grid_state_path:
+        grid_state = torch.load(grid_state_path, map_location="cpu", weights_only=False)
+    y_real = None
+    if grid_state is not None and sim.admittance_spectral is not None:
+        y_real = _real_admittance_from_grid(sim.admittance_spectral, grid_state, centers)
     sphere_fields = [
         ("|B_r|", _scalar_from_sh(B_rad_ph, centers), "T"),
         ("|dB/dt|", omega * _scalar_from_sh(B_rad_ph, centers), "T/s"),
-        ("|Y_s|", _scalar_from_sh(Y_s_spec, centers), "S"),
+        ("Re(Y_s)", y_real if y_real is not None else _scalar_from_sh(Y_s_spec, centers), "S"),
         ("|E_tor|", _toroidal_vec_mag(E_tor_ph, centers), "V/m"),
         ("|K_tor|", _toroidal_vec_mag(K_tor_ph, centers), "A/m"),
         ("|B_emit,r|", _scalar_from_sh(B_rad_emit_ph, centers), "T"),
@@ -108,12 +116,21 @@ def render_demo_overview(
             # Sphere subplot
             ax_sph = fig.add_subplot(gs[local_row, 1], projection="3d")
             mags = sphere_fields[row][1]
-            vmax = float(np.max(mags)) if mags.size else 1.0
-            vmax = vmax if vmax > 0 else 1.0
-            norm = mcolors.Normalize(vmin=0.0, vmax=vmax)
+            if row == 2 and y_real is not None:
+                vmax = float(np.max(np.abs(mags))) if mags.size else 1.0
+                vmax = vmax if vmax > 0 else 1.0
+                norm = mcolors.Normalize(vmin=-vmax, vmax=vmax)
+                map_colors = plt.get_cmap("coolwarm")
+                face_colors = map_colors(norm(mags))
+            else:
+                vmax = float(np.max(mags)) if mags.size else 1.0
+                vmax = vmax if vmax > 0 else 1.0
+                norm = mcolors.Normalize(vmin=0.0, vmax=vmax)
+                map_colors = cmap
+                face_colors = map_colors(norm(mags))
             collection = Poly3DCollection(
                 tri_verts,
-                facecolors=cmap(norm(mags)),
+                facecolors=face_colors,
                 edgecolor="none",
                 linewidth=0.05,
                 antialiased=True,
@@ -127,7 +144,7 @@ def render_demo_overview(
             ax_sph.set_axis_off()
             ax_sph.set_title(f"{sphere_fields[row][0]} ({sphere_fields[row][2]})", pad=12)
             ax_sph.view_init(elev=elev, azim=azim)
-            mappable = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            mappable = plt.cm.ScalarMappable(cmap=map_colors, norm=norm)
             mappable.set_array(mags)
             fig.colorbar(mappable, ax=ax_sph, shrink=0.7, pad=0.005, label=sphere_fields[row][2])
 
@@ -160,6 +177,7 @@ def main():
     parser.add_argument("--azim", type=float, default=30.0, help="Azimuth angle for each sphere view.")
     parser.add_argument("--save", type=str, default="demo_currents_overview.png", help="Output image path (None to disable).")
     parser.add_argument("--no-show", action="store_true", help="Do not display the plot window.")
+    parser.add_argument("--grid-state", type=str, default=None, help="Optional grid state path for Y_s real map.")
     args = parser.parse_args()
     render_demo_overview(
         data_path=args.input,
@@ -169,7 +187,23 @@ def main():
         azim=args.azim,
         save_path=args.save,
         show=not args.no_show,
+        grid_state_path=args.grid_state,
     )
+
+
+def _real_admittance_from_grid(
+    coeffs: torch.Tensor,
+    grid_state: dict,
+    centers: torch.Tensor,
+) -> np.ndarray:
+    positions = grid_state["positions"].to(torch.float64)
+    weights = grid_state["areas"].to(torch.float64)
+    vals = transforms.sh_inverse(coeffs, positions, weights).reshape(-1)
+    vals = vals.to(torch.complex128).cpu().numpy()
+    grid_pos = positions.detach().cpu().to(torch.float64)
+    centers = centers.detach().cpu().to(torch.float64)
+    nearest = torch.cdist(centers, grid_pos).argmin(dim=1).cpu().numpy()
+    return vals.real[nearest]
 
 
 if __name__ == "__main__":

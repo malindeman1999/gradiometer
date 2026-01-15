@@ -70,7 +70,11 @@ def _checkerboard_admittance(positions: torch.Tensor, sigma_low: float, sigma_hi
 
 
 
-def run(compute_gradients: bool = False, checker_divisions: int = 6) -> Tuple[PhasorSimulation, PhasorSimulation, str, int, bool]:
+def run(
+    compute_gradients: bool = False,
+    checker_divisions: int = 6,
+    first_order_only: bool = False,
+) -> Tuple[PhasorSimulation, str, int, bool, str]:
     # Grid and driver
     # Increase spatial resolution (double nside) and allow higher spectral order
     lmax_target = 10
@@ -121,34 +125,39 @@ def run(compute_gradients: bool = False, checker_divisions: int = 6) -> Tuple[Ph
         )
     _log(f"Mixing matrix ready with shape {tuple(mixing_matrix.shape)}")
 
-    first = _clone_ps(base)
-    with _time_block("Solving first-order (no feedback) currents with precomputed mixing matrix"):
-        first.E_toroidal = toroidal_e_from_radial_b(first.B_radial, first.omega, first.radius_m)
-        b_flat = _flatten_lm(first.B_radial.to(torch.complex128))
-        k_flat = mixing_matrix @ b_flat
-        first.K_toroidal = _unflatten_lm(k_flat, grid_cfg.lmax)
-        first.K_poloidal = torch.zeros_like(first.K_toroidal)
-        first.B_tor_emit, first.B_pol_emit, first.B_rad_emit = inductance.spectral_b_from_surface_currents(
-            first.K_toroidal, first.K_poloidal, radius=first.radius_m
-        )
-        first.solver_variant = "spectral_first_order_precomputed_gaunt_sparse"
-
-    selfc = _clone_ps(base)
-    # Use precomputed Gaunt cache (loader) instead of on-the-fly computation
-    with _time_block("Solving self-consistent system (matrix inversion) using precomputed mixing matrix"):
-        solve_spectral_self_consistent_sim_precomputed(selfc, gaunt_sparse=G_sparse, mixing_matrix=mixing_matrix)
-    _log("Self-consistent solve complete.")
+    sim_out: PhasorSimulation
+    label: str
+    if first_order_only:
+        sim_out = _clone_ps(base)
+        label = "first_order"
+        with _time_block("Solving first-order (no feedback) currents with precomputed mixing matrix"):
+            sim_out.E_toroidal = toroidal_e_from_radial_b(sim_out.B_radial, sim_out.omega, sim_out.radius_m)
+            b_flat = _flatten_lm(sim_out.B_radial.to(torch.complex128))
+            k_flat = mixing_matrix @ b_flat
+            sim_out.K_toroidal = _unflatten_lm(k_flat, grid_cfg.lmax)
+            sim_out.K_poloidal = torch.zeros_like(sim_out.K_toroidal)
+            sim_out.B_tor_emit, sim_out.B_pol_emit, sim_out.B_rad_emit = inductance.spectral_b_from_surface_currents(
+                sim_out.K_toroidal, sim_out.K_poloidal, radius=sim_out.radius_m
+            )
+            sim_out.solver_variant = "spectral_first_order_precomputed_gaunt_sparse"
+    else:
+        sim_out = _clone_ps(base)
+        label = "self_consistent"
+        # Use precomputed Gaunt cache (loader) instead of on-the-fly computation
+        with _time_block("Solving self-consistent system (matrix inversion) using precomputed mixing matrix"):
+            solve_spectral_self_consistent_sim_precomputed(sim_out, gaunt_sparse=G_sparse, mixing_matrix=mixing_matrix)
+        _log("Self-consistent solve complete.")
 
     _log("Saving phasor snapshot and launching render pipeline...")
 
-    out_path = Path("figures/nonuniform_self_consistent.pt")
+    out_path = Path(f"figures/nonuniform_{label}.pt")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    _log(f"Saving self-consistent phasor snapshot to {out_path}...")
-    torch.save({"phasor_sim": selfc}, out_path)
+    _log(f"Saving phasor snapshot to {out_path}...")
+    torch.save({"phasor_sim": sim_out}, out_path)
     # Choose sphere sampling commensurate with spectral bandwidth (~4*(lmax+1)^2 pixels).
     desired_faces = max(20, 4 * (grid_cfg.lmax + 1) ** 2)
     subdivisions = max(1, math.ceil(math.log(desired_faces / 20, 4)))
-    return first, selfc, str(out_path), subdivisions, compute_gradients
+    return sim_out, str(out_path), subdivisions, compute_gradients, label
 
 
 def main() -> None:
@@ -161,25 +170,31 @@ def main() -> None:
         default=6,
         help="Number of theta/phi divisions for checkerboard admittance pattern.",
     )
+    parser.add_argument(
+        "--first-order-only",
+        action="store_true",
+        help="Compute only the first-order (no feedback) response instead of the self-consistent solution.",
+    )
     args = parser.parse_args()
 
-    first, selfc, out_path, subdivisions, compute_gradients = run(
-        compute_gradients=args.gradients, checker_divisions=args.checker_divisions
+    sim_out, out_path, subdivisions, compute_gradients, label = run(
+        compute_gradients=args.gradients, checker_divisions=args.checker_divisions, first_order_only=args.first_order_only
     )
     # Print quick comparison metric
-    diff = (first.K_toroidal - selfc.K_toroidal).abs().max().item() if first.K_toroidal is not None else float("nan")
-    _log(f"Max |K_first - K_self| = {diff:.3e}")
-    # Render spectral plots and sphere map of self-consistent solution
+    if label == "self_consistent":
+        _log("Solved self-consistent response (first-order comparison skipped).")
+    else:
+        _log("Solved first-order response only.")
+    # Render spectral plots and sphere map of the chosen solution
     face_count = 20 * (4 ** subdivisions)
     _log(
-        f"Rendering overview plots with subdivisions={subdivisions} "
-        f"(~{face_count} sphere pixels per map, lmax={selfc.lmax})..."
+        f"Rendering overview plots with subdivisions={subdivisions} (~{face_count} sphere pixels per map, lmax={sim_out.lmax})..."
     )
     with _time_block("Rendering overview plots"):
         render_demo_overview(
             data_path=out_path,
             subdivisions=subdivisions,
-            save_path="figures/nonuniform_self_consistent.png",
+            save_path=f"figures/nonuniform_{label}.png",
             show=False,
         )
     if compute_gradients:
@@ -188,13 +203,13 @@ def main() -> None:
         obs_alt_m = 100e3
         surface_title = f"RSS |grad_B_emit| at surface (alt=0 km)"
         alt_title = f"RSS |grad_B_emit| at alt={obs_alt_m/1000:.0f} km"
-        surface_path = "figures/nonuniform_grad_surface.png"
-        alt_path = "figures/nonuniform_grad_alt.png"
+        surface_path = f"figures/nonuniform_grad_surface_{label}.png"
+        alt_path = f"figures/nonuniform_grad_alt_{label}.png"
         with _time_block("Rendering surface gradient map"):
-            render_gradient_map(selfc, altitude_m=0.0, subdivisions=subdivisions, save_path=surface_path, title=surface_title)
+            render_gradient_map(sim_out, altitude_m=0.0, subdivisions=subdivisions, save_path=surface_path, title=surface_title)
         with _time_block("Rendering altitude gradient map"):
-            render_gradient_map(selfc, altitude_m=obs_alt_m, subdivisions=subdivisions, save_path=alt_path, title=alt_title)
-    _log("Saved self-consistent snapshot and all overview/gradient figures.")
+            render_gradient_map(sim_out, altitude_m=obs_alt_m, subdivisions=subdivisions, save_path=alt_path, title=alt_title)
+    _log("Saved snapshot and all overview/gradient figures.")
 
 
 if __name__ == "__main__":
