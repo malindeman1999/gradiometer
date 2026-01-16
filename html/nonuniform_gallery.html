@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Nonuniform Admittance Gallery</title>
+  <style>
+    :root {
+      --bg: #0b0f1b;
+      --panel: rgba(21, 27, 44, 0.9);
+      --text: #e9edf7;
+      --muted: #9aa7c3;
+      --accent: #7bd3ff;
+      --border: rgba(255,255,255,0.07);
+      --glow: 0 18px 48px rgba(123, 211, 255, 0.18);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Poppins", "Segoe UI", "Helvetica Neue", sans-serif;
+      background: radial-gradient(circle at 20% 20%, #121a2b, #0b0f1b 55%),
+                  radial-gradient(circle at 80% 0%, #12213a, transparent 35%),
+                  #0b0f1b;
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      padding: 32px;
+      text-align: center;
+    }
+    h1 {
+      margin: 0;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+    p.lead {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-weight: 400;
+    }
+    .grid {
+      max-width: 1200px;
+      margin: 0 auto 40px;
+      padding: 0 24px 40px;
+      display: grid;
+      gap: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: var(--glow);
+      overflow: hidden;
+    }
+    .card h3 {
+      margin: 0;
+      padding: 14px 16px 8px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .card p {
+      margin: 0 16px 12px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .card img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-top: 1px solid var(--border);
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      margin-right: 8px;
+      background: rgba(123, 211, 255, 0.15);
+      border: 1px solid rgba(123, 211, 255, 0.4);
+      border-radius: 10px;
+      font-size: 12px;
+      color: var(--accent);
+      vertical-align: middle;
+    }
+    .section {
+      grid-column: 1 / -1;
+      padding: 22px 24px;
+      border: 1px dashed var(--border);
+      border-radius: 16px;
+      background: rgba(14, 20, 34, 0.9);
+    }
+    .section h2 {
+      margin: 0 0 6px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+    }
+    .section p {
+      margin: 0;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Nonuniform Spectral Admittance</h1>
+    <p class="lead">Complex Y_s with +X driver, self-consistent magnitude maps, gradients, and spectra.</p>
+  </header>
+  <main class="grid">
+    <div class="section">
+      <h2>Self-consistent solutions</h2>
+      <p>Full feedback run with harmonic bars, sphere maps, and gradient outputs.</p>
+    </div>
+    <div class="card">
+      <h3><span class="badge">PNG</span> Overview (rows 1–3, self-consistent)</h3>
+      <p>Harmonic bars alongside sphere maps (self-consistent solution).</p>
+      <img src="../figures/nonuniform_self_consistent_overview.png" alt="Nonuniform admittance overview rows 1-3 (self-consistent)">
+    </div>
+    <div class="card">
+      <h3><span class="badge">PNG</span> Overview (rows 4–6, self-consistent)</h3>
+      <p>Additional rows continuing the harmonic and sphere-map views.</p>
+      <img src="../figures/nonuniform_self_consistent_overview_part2.png" alt="Nonuniform admittance overview rows 4-6 (self-consistent)">
+    </div>
+    <div class="card">
+      <h3><span class="badge">PNG</span> |∇B_emit| RSS (surface, self-consistent)</h3>
+      <p>Gradient magnitude of emitted B on the surface (alt=0 km).</p>
+      <img src="../figures/nonuniform_grad_0m_self_consistent.png" alt="RSS gradient of emitted magnetic field at surface (self-consistent)">
+    </div>
+    <div class="card">
+      <h3><span class="badge">PNG</span> |∇B_emit| RSS (100 km, self-consistent)</h3>
+      <p>Gradient magnitude of emitted B at observation altitude (+100 km).</p>
+      <img src="../figures/nonuniform_grad_100000m_self_consistent.png" alt="RSS gradient of emitted magnetic field at 100 km (self-consistent)">
+    </div>
+    <div class="section">
+      <h2>First-order solutions</h2>
+      <p>Linearized (no feedback) outputs for comparison with the self-consistent run.</p>
+    </div>
+    <div class="card">
+      <h3><span class="badge">PNG</span> Overview (rows 1–3, first-order)</h3>
+      <p>Harmonic bars alongside sphere maps (first-order solution).</p>
+      <img src="../figures/nonuniform_first_order_overview.png" alt="Nonuniform admittance overview rows 1-3 (first-order)">
+    </div>
+    <div class="card">
+      <h3><span class="badge">PNG</span> Overview (rows 4–6, first-order)</h3>
+      <p>Additional rows continuing the harmonic and sphere-map views.</p>
+      <img src="../figures/nonuniform_first_order_overview_part2.png" alt="Nonuniform admittance overview rows 4-6 (first-order)">
+    </div>
+    <div class="card">
+      <h3><span class="badge">PNG</span> |∇B_emit| RSS (surface, first-order)</h3>
+      <p>Gradient magnitude of emitted B on the surface (alt=0 km).</p>
+      <img src="../figures/nonuniform_grad_0m_first_order.png" alt="RSS gradient of emitted magnetic field at surface (first-order)">
+    </div>
+    <div class="card">
+      <h3><span class="badge">PNG</span> |∇B_emit| RSS (100 km, first-order)</h3>
+      <p>Gradient magnitude of emitted B at observation altitude (+100 km).</p>
+      <img src="../figures/nonuniform_grad_100000m_first_order.png" alt="RSS gradient of emitted magnetic field at 100 km (first-order)">
+    </div>
+  </main>
+</body>
+</html>
