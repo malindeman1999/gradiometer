@@ -401,7 +401,12 @@ def step3_solve_currents(first_order_only: bool, log) -> Path:
     base = _build_phasor_base(state)
 
     log(f"Assembling Gaunt tensor from {GAUNT_CACHE} (lmax_limit={grid_cfg.lmax})...")
-    G_sparse, gaunt_meta = assemble_in_memory(cache_dir=GAUNT_CACHE, lmax_limit=grid_cfg.lmax, verbose=True)
+    G_sparse, gaunt_meta = assemble_in_memory(
+        cache_dir=GAUNT_CACHE,
+        lmax_limit=grid_cfg.lmax,
+        verbose=True,
+        plot=False,
+    )
     log(f"Gaunt tensor nnz={G_sparse._nnz()}, complete_L={gaunt_meta.get('complete_L')}")
 
     log("Building sparse mixing matrix...")
