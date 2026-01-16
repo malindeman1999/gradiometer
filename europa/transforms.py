@@ -7,8 +7,18 @@ from typing import Dict, Tuple
 import numpy as np
 import torch
 
-# Use SciPy's complex spherical harmonics; prefer sph_harm for consistent signature (m, l, phi, theta)
-from scipy.special import sph_harm as sph_harm_fn
+# Use SciPy's complex spherical harmonics; prefer sph_harm for (m, l, phi, theta) signature.
+try:
+    from scipy.special import sph_harm as _sph_harm  # SciPy < 1.17
+
+    def sph_harm_fn(m, l, phi, theta):
+        return _sph_harm(m, l, phi, theta)
+
+except ImportError:  # SciPy >= 1.17
+    from scipy.special import sph_harm_y as _sph_harm_y
+
+    def sph_harm_fn(m, l, phi, theta):
+        return _sph_harm_y(l, m, theta, phi)
 
 
 def _angles_from_positions(positions: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
