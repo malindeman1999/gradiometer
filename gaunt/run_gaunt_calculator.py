@@ -1,12 +1,14 @@
 """
-Gaunt cache builder that saves one checkpoint per L shell (complete over M) with no meta sidecars.
+Gaunt cache builder that saves one checkpoint per L shell, storing only a 1/12
+canonical branch and regenerating the rest via symmetry at load time.
 
 Naming: gaunt_wigxjpf_L##.pt under CACHE_DIR. Each file stores a "shell" containing
-all entries where max(L, l0, l) == shell_L. If a file already exists for a given
+canonical entries where max(L, l0, l) == shell_L. If a file already exists for a given
 shell_L, it is skipped. This avoids partial ranges and keeps bookkeeping simple.
 
 Usage:
     python gaunt/run_gaunt_calculator.py
+    python gaunt/run_gaunt_calculator.py --plot
 
 This script resumes automatically: it skips any L checkpoint files that already exist
 and only computes missing L values. Output is written under CACHE_DIR.
@@ -48,10 +50,11 @@ def _append_block(
     lmax_y: int,
     lmax_b: int,
     shell_L: int,
+    triple_cache: dict[tuple[tuple[int, int], tuple[int, int], tuple[int, int]], float],
 ) -> int:
     """
-    Append Gaunt entries for a single (L, M>=0) block, using symmetry to mirror to -M.
-    Only entries satisfying max(L, l0, l) == shell_L are included.
+    Append Gaunt entries for a single (L, M>=0) block, storing only the canonical branch.
+    Only canonical entries satisfying max(L, l0, l) == shell_L are included.
     """
     l0_all = []
     m0_all = []
@@ -66,7 +69,6 @@ def _append_block(
     m_vec = M - m0_vec
 
     Ls: list[np.ndarray] = []
-    Ms: list[np.ndarray] = []
     l0s: list[np.ndarray] = []
     m0s: list[np.ndarray] = []
     ls: list[np.ndarray] = []
@@ -88,7 +90,6 @@ def _append_block(
         if l_arr.size == 0:
             continue
         Ls.append(np.full_like(l_arr, L))
-        Ms.append(np.full_like(l_arr, M))
         l0s.append(np.full_like(l_arr, l0i))
         m0s.append(np.full_like(l_arr, m0i))
         ls.append(l_arr)
@@ -98,13 +99,55 @@ def _append_block(
         return 0
 
     Ls_arr = np.concatenate(Ls)
-    Ms_arr = np.concatenate(Ms)
     l0_arr = np.concatenate(l0s)
     m0_arr = np.concatenate(m0s)
     l_arr = np.concatenate(ls)
     m_arr = np.concatenate(ms)
 
-    vals_block = gaunt_coeff_vectorized_wigxjpf(Ls_arr, Ms_arr, l0_arr, m0_arr, l_arr, m_arr)
+    triple_keys: list[tuple[tuple[int, int], tuple[int, int], tuple[int, int]]] = []
+    new_keys: list[tuple[tuple[int, int], tuple[int, int], tuple[int, int]]] = []
+    new_key_set: set[tuple[tuple[int, int], tuple[int, int], tuple[int, int]]] = set()
+
+    def parity_sign(m_val: int) -> int:
+        return -1 if (m_val & 1) else 1
+
+    def sorted_triple_key(
+        l1: int, m1: int, l2: int, m2: int, l3: int, m3: int
+    ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+        a = (int(l1), int(m1))
+        b = (int(l2), int(m2))
+        c = (int(l3), int(m3))
+        if a > b:
+            a, b = b, a
+        if b > c:
+            b, c = c, b
+        if a > b:
+            a, b = b, a
+        return (a, b, c)
+
+    for l0i, m0i, li, mi in zip(l0_arr, m0_arr, l_arr, m_arr):
+        key = sorted_triple_key(L, -M, int(l0i), int(m0i), int(li), int(mi))
+        triple_keys.append(key)
+        if key not in triple_cache and key not in new_key_set:
+            new_keys.append(key)
+            new_key_set.add(key)
+
+    if new_keys:
+        l1 = np.array([k[0][0] for k in new_keys], dtype=int)
+        m1 = np.array([k[0][1] for k in new_keys], dtype=int)
+        l2 = np.array([k[1][0] for k in new_keys], dtype=int)
+        m2 = np.array([k[1][1] for k in new_keys], dtype=int)
+        l3 = np.array([k[2][0] for k in new_keys], dtype=int)
+        m3 = np.array([k[2][1] for k in new_keys], dtype=int)
+
+        vals_raw = gaunt_coeff_vectorized_wigxjpf(l1, -m1, l2, m2, l3, m3)
+        signs = np.where((m1 & 1) == 0, 1.0, -1.0)
+        vals_T = signs * vals_raw
+        for key, val in zip(new_keys, vals_T):
+            triple_cache[key] = float(val)
+
+    vals_block = np.array([triple_cache[key] for key in triple_keys], dtype=np.float64)
+    vals_block *= parity_sign(M)
     nz_mask = vals_block != 0.0
     if not np.any(nz_mask):
         return 0
@@ -114,10 +157,26 @@ def _append_block(
     l_keep = l_arr[nz_mask]
     m_keep = m_arr[nz_mask]
 
+    base = 2 * shell_L + 3
+    shift = shell_L + 1
+    key1 = np.full_like(l0_keep, L * base + (-M + shift))
+    key2 = l0_keep * base + (m0_keep + shift)
+    key3 = l_keep * base + (m_keep + shift)
+    order_mask = (key1 <= key2) & (key2 <= key3)
+
+    keep_mask = order_mask
+    if not np.any(keep_mask):
+        return 0
+    vb = vb[keep_mask]
+    l0_keep = l0_keep[keep_mask]
+    m0_keep = m0_keep[keep_mask]
+    l_keep = l_keep[keep_mask]
+    m_keep = m_keep[keep_mask]
+
     rows.extend(
         zip(
             np.full_like(vb, L, dtype=int),
-            (L + Ms_arr[nz_mask]).astype(int),
+            np.full_like(vb, L + M, dtype=int),
             l0_keep.astype(int),
             (lmax_y + m0_keep).astype(int),
             l_keep.astype(int),
@@ -127,20 +186,6 @@ def _append_block(
     vals.extend(vb.tolist())
 
     added = vb.size
-
-    if M > 0:
-        rows.extend(
-            zip(
-                np.full_like(vb, L, dtype=int),
-                (L - Ms_arr[nz_mask]).astype(int),
-                l0_keep.astype(int),
-                (lmax_y - m0_keep).astype(int),
-                l_keep.astype(int),
-                (lmax_b - m_keep).astype(int),
-            )
-        )
-        vals.extend(vb.tolist())
-        added += vb.size
 
     return int(added)
 
@@ -201,10 +246,10 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Build Gaunt cache shell checkpoints.")
-    parser.add_argument("--no-plot", action="store_true", help="Suppress shell plot animation.")
+    parser.add_argument("--plot", action="store_true", help="Show shell plot animation.")
     args = parser.parse_args()
 
-    plot = not args.no_plot
+    plot = bool(args.plot)
     if plot:
         import matplotlib.pyplot as plt
 
@@ -232,9 +277,10 @@ def main() -> None:
 
         rows_delta: list[tuple[int, int, int, int, int, int]] = []
         vals_delta: list[float] = []
+        triple_cache: dict[tuple[tuple[int, int], tuple[int, int], tuple[int, int]], float] = {}
         for L in range(shell_L + 1):
             for M in range(0, L + 1):
-                _append_block(L, M, rows_delta, vals_delta, shell_L, shell_L, shell_L)
+                _append_block(L, M, rows_delta, vals_delta, shell_L, shell_L, shell_L, triple_cache)
 
         if not rows_delta:
             print(f"Shell L={shell_L} produced no entries; writing empty placeholder.")
@@ -265,6 +311,7 @@ def main() -> None:
             "sparse": True,
             "prune_tol": None,
             "symmetric": True,
+            "symmetry_mode": "canonical12",
             "last_L": shell_L,
             "last_M": shell_L,
             "range_start_L": 0,

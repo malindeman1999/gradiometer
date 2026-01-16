@@ -5,6 +5,7 @@ Behavior (new format):
 - Reads per-L checkpoint files named gaunt_wigxjpf_L##.pt in the cache directory.
   Each file contains a shell where max(L, l0, l) == shell_L (no sidecar metadata).
   We assume shells are complete and non-overlapping.
+  Canonical-only checkpoints (symmetry_mode=canonical12) are expanded on load.
 """
 from __future__ import annotations
 
@@ -28,6 +29,64 @@ def _require_all_L(ckpts: list[Path], assemble_L: int) -> None:
     missing = [L for L in range(assemble_L + 1) if L not in have]
     if missing:
         raise FileNotFoundError(f"Missing Gaunt checkpoint(s) for L={missing}")
+
+
+def _expand_canonical_entries(
+    idx: torch.Tensor,
+    vals: torch.Tensor,
+    lmax_y: int,
+    lmax_b: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if idx.numel() == 0:
+        return idx, vals
+    idx_np = idx.cpu().numpy()
+    vals_np = vals.cpu().numpy()
+
+    L = idx_np[0]
+    M = idx_np[1] - L
+    l0 = idx_np[2]
+    m0 = idx_np[3] - lmax_y
+    l = idx_np[4]
+    m = idx_np[5] - lmax_b
+
+    T = vals_np * np.where((M & 1) == 0, 1.0, -1.0)
+
+    Ls = np.stack([L, l0, l], axis=0)
+    Ms = np.stack([-M, m0, m], axis=0)
+
+    perms = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
+    sign_flips = (1, -1)
+
+    idx_blocks: list[np.ndarray] = []
+    vals_blocks: list[np.ndarray] = []
+    for s in sign_flips:
+        Ms_s = Ms * s
+        for p in perms:
+            Lp = Ls[p[0]]
+            m1 = Ms_s[p[0]]
+            l0p = Ls[p[1]]
+            m0p = Ms_s[p[1]]
+            lp = Ls[p[2]]
+            mp = Ms_s[p[2]]
+            Mp = -m1
+            signs = np.where((Mp & 1) == 0, 1.0, -1.0)
+            vals_p = T * signs
+            idx_block = np.vstack(
+                [
+                    Lp,
+                    Lp + Mp,
+                    l0p,
+                    lmax_y + m0p,
+                    lp,
+                    lmax_b + mp,
+                ]
+            )
+            idx_blocks.append(idx_block)
+            vals_blocks.append(vals_p)
+
+    idx_exp = np.concatenate(idx_blocks, axis=1)
+    vals_exp = np.concatenate(vals_blocks, axis=0)
+    return torch.tensor(idx_exp, dtype=torch.int64), torch.tensor(vals_exp, dtype=torch.float64)
 
 
 def _update_shell_plot(fig, ax, counts: np.ndarray, max_L: int, shell_L: int, title: str, cbar_state, plt):
@@ -126,6 +185,7 @@ def assemble_in_memory(cache_dir: Path, lmax_limit: Optional[int], verbose: bool
     idx_all: List[List[int]] = [[], [], [], [], [], []]
     vals_all: List[float] = []
     t_start = time.perf_counter()
+    expanded_any = False
     for i, path in enumerate(ckpts, start=1):
         L_val = int(path.stem.split("_L")[-1])
         if L_val > assemble_L:
@@ -174,6 +234,11 @@ def assemble_in_memory(cache_dir: Path, lmax_limit: Optional[int], verbose: bool
             idx_f[5] = idx_f[5] + shift_b
         vals_f = vals[mask]
         added = int(mask.sum())
+        sym_mode = obj.get("symmetry_mode") if isinstance(obj, dict) else None
+        if sym_mode == "canonical12":
+            idx_f, vals_f = _expand_canonical_entries(idx_f, vals_f, lmax_y_lim, lmax_b_lim)
+            added = idx_f.shape[1]
+            expanded_any = True
         for d in range(6):
             idx_all[d].extend(idx_f[d].tolist())
         vals_all.extend(vals_f.tolist())
@@ -204,6 +269,19 @@ def assemble_in_memory(cache_dir: Path, lmax_limit: Optional[int], verbose: bool
 
     idx_tensor = torch.tensor(idx_all, dtype=torch.int64)
     vals_tensor = torch.tensor(vals_all, dtype=torch.float64)
+    if expanded_any:
+        size = (
+            assemble_L + 1,
+            2 * assemble_L + 1,
+            lmax_y_lim + 1,
+            2 * lmax_y_lim + 1,
+            lmax_b_lim + 1,
+            2 * lmax_b_lim + 1,
+        )
+        G_tmp = torch.sparse_coo_tensor(idx_tensor, vals_tensor, size=size).coalesce()
+        C_tmp = torch.sparse_coo_tensor(idx_tensor, torch.ones_like(vals_tensor), size=size).coalesce()
+        idx_tensor = G_tmp.indices()
+        vals_tensor = G_tmp.values() / C_tmp.values()
     max_L_collected = int(idx_tensor[0].max().item()) if idx_tensor.numel() > 0 else -1
     if max_L_collected < assemble_L:
         raise RuntimeError(
@@ -234,6 +312,7 @@ def assemble_in_memory(cache_dir: Path, lmax_limit: Optional[int], verbose: bool
         "sparse": True,
         "prune_tol": None,
         "symmetric": True,
+        "symmetry_mode": "expanded12" if expanded_any else "full",
     }
     return G_assembled, meta_out
 
