@@ -45,3 +45,4 @@ build/
 # Data / outputs
 results/
 outputs/
+artifacts/
