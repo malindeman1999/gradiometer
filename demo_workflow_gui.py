@@ -102,6 +102,23 @@ def _lmax_for_target_faces(faces: int) -> int:
     return best
 
 
+def _mean_face_center_spacing_km(subdivisions: int, radius_m: float) -> float:
+    """Approximate mean nearest-neighbor spacing between face centers."""
+    _, _, centers = _build_mesh(radius_m, subdivisions=subdivisions, stride=1)
+    centers = centers.to(dtype=torch.float64)
+    count = int(centers.shape[0])
+    if count < 2:
+        return 0.0
+    sample_cap = 2000
+    if count > sample_cap:
+        idx = torch.randperm(count)[:sample_cap]
+        centers = centers[idx]
+    dists = torch.cdist(centers, centers)
+    dists.fill_diagonal_(float("inf"))
+    nn = dists.min(dim=1).values
+    return float(nn.mean().item() / 1000.0)
+
+
 def _save_state(name: str, payload) -> Path:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     path = STATE_DIR / name
@@ -116,8 +133,8 @@ def _load_state(name: str):
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def step1_build_grid_admittance(target_faces: int, lmax: int, checker_divisions: int, log) -> Path:
-    subdiv = _subdivisions_from_faces(target_faces)
+def step1_build_grid_admittance(subdiv: int, lmax: int, checker_divisions: int, log) -> Path:
+    subdiv = max(0, int(subdiv))
     actual_faces = _faces_for_subdiv(subdiv)
     nside = _nside_from_subdivisions(subdiv)
     grid_cfg = GridConfig(nside=nside, lmax=lmax, radius_m=1.56e6, device="cpu")
@@ -505,55 +522,52 @@ def main():
 
     # Inputs for step 1
     ttk.Label(frm, text="Step 1: Grid + admittance").grid(row=0, column=0, sticky="w")
-    ttk.Label(frm, text="faces (approx)").grid(row=0, column=1, sticky="e")
-    faces_var = tk.StringVar(value="80")
-    ttk.Entry(frm, textvariable=faces_var, width=8).grid(row=0, column=2, sticky="w")
-    ttk.Label(frm, text="lmax").grid(row=0, column=3, sticky="e")
+    ttk.Label(frm, text="effective subdivisions").grid(row=0, column=1, sticky="e")
+    subdiv_var = tk.StringVar(value="1")
+    ttk.Entry(frm, textvariable=subdiv_var, width=8).grid(row=0, column=2, sticky="w")
+    ttk.Label(frm, text="faces (exact)").grid(row=0, column=3, sticky="e")
+    faces_var = tk.StringVar(value=str(_faces_for_subdiv(int(subdiv_var.get()))))
+    ttk.Label(frm, textvariable=faces_var).grid(row=0, column=4, sticky="w")
+    ttk.Label(frm, text="face spacing (km)").grid(row=0, column=5, sticky="e")
+    spacing_var = tk.StringVar(
+        value=f"{_mean_face_center_spacing_km(int(subdiv_var.get()), 1.56e6):.1f}"
+    )
+    ttk.Label(frm, textvariable=spacing_var).grid(row=0, column=6, sticky="w")
+    ttk.Label(frm, text="lmax").grid(row=0, column=7, sticky="e")
     lmax_var = tk.StringVar(value="8")
-    ttk.Entry(frm, textvariable=lmax_var, width=6).grid(row=0, column=4, sticky="w")
-    ttk.Label(frm, text="checker divisions").grid(row=0, column=5, sticky="e")
+    ttk.Entry(frm, textvariable=lmax_var, width=6).grid(row=0, column=8, sticky="w")
+    ttk.Label(frm, text="checker divisions").grid(row=0, column=9, sticky="e")
     div_var = tk.StringVar(value="2")
-    ttk.Entry(frm, textvariable=div_var, width=6).grid(row=0, column=6, sticky="w")
-    subdiv_var = tk.StringVar(value="?")
-    sh_count_var = tk.StringVar(value="?")
-    ttk.Label(frm, text="effective subdivisions=").grid(row=0, column=7, sticky="e")
-    ttk.Label(frm, textvariable=subdiv_var).grid(row=0, column=8, sticky="w")
+    ttk.Entry(frm, textvariable=div_var, width=6).grid(row=0, column=10, sticky="w")
+    sh_count_var = tk.StringVar(value="81")
     ttk.Label(frm, text="# SH coeffs=").grid(row=0, column=11, sticky="e")
     ttk.Label(frm, textvariable=sh_count_var).grid(row=0, column=12, sticky="w")
-    btn_faces_from_l = tk.Button(
-        frm,
-        text="Set faces from lmax",
-        command=lambda: [
-            subdiv_var.set(str(_subdivisions_from_faces((int(lmax_var.get()) + 1) ** 2))),
-            faces_var.set(str(_faces_for_subdiv(int(subdiv_var.get())))),
-            sh_count_var.set(str((int(lmax_var.get()) + 1) ** 2)),
-        ],
-    )
-    btn_faces_from_l.grid(row=0, column=13, padx=4)
     btn_l_from_faces = tk.Button(
         frm,
         text="Set lmax from faces",
         command=lambda: [
-            subdiv_var.set(str(_subdivisions_from_faces(int(faces_var.get())))),
             faces_var.set(str(_faces_for_subdiv(int(subdiv_var.get())))),
+            spacing_var.set(
+                f"{_mean_face_center_spacing_km(int(subdiv_var.get()), 1.56e6):.1f}"
+            ),
             lmax_var.set(
                 str(
                     _lmax_for_target_faces(
-                        _faces_for_subdiv(int(subdiv_var.get()))
+                        int(faces_var.get())
                     )
                 )
             ),
             sh_count_var.set(str((int(lmax_var.get()) + 1) ** 2)),
         ],
     )
-    btn_l_from_faces.grid(row=0, column=14, padx=4)
+    btn_l_from_faces.grid(row=0, column=13, padx=4)
     btn_step1 = tk.Button(
         frm,
         text="Run Step 1",
         command=lambda: run_step(
             btn_step1,
             lambda: step1_build_grid_admittance(
-                int(faces_var.get()),
+                int(subdiv_var.get()),
                 int(lmax_var.get()),
                 int(div_var.get()),
                 lambda msg: _log(log_widget, msg),
@@ -561,11 +575,14 @@ def main():
             on_success=lambda res: (
                 subdiv_var.set(str(res[1]) if isinstance(res, tuple) and len(res) > 1 else "?"),
                 faces_var.set(str(res[3]) if isinstance(res, tuple) and len(res) > 3 else "?"),
+                spacing_var.set(
+                    f"{_mean_face_center_spacing_km(int(subdiv_var.get()), 1.56e6):.1f}"
+                ),
                 sh_count_var.set(str((int(lmax_var.get()) + 1) ** 2)),
             ),
         ),
     )
-    btn_step1.grid(row=0, column=15, padx=6)
+    btn_step1.grid(row=0, column=14, padx=6)
 
     # Step 1b
     ttk.Label(frm, text="Step 1b: Roundtrip check").grid(row=1, column=0, sticky="w")
