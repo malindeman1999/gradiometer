@@ -1,11 +1,15 @@
 """
-GUI for running the non-uniform demo pipeline in four stages:
-1) Build grid + admittance (checkerboard pattern)
-2) Build ambient field
-3) Solve currents (self-consistent by default, or first-order)
-4) Render overview and gradient plots
+GUI for comparing uniform and spectral (non-uniform) solvers using the same
+uniform thin-shell admittance.
 
-Each step saves its state so runs can be resumed later.
+Steps:
+1) Build grid + uniform admittance
+2) Build ambient field
+3) Uniform solves (first-order, self-consistent)
+4) Spectral first-order solve + plots
+5) Spectral self-consistent solve + plots
+6) Spectral iterative solve + plots
+7) Compare solves against uniform first-order
 """
 import tkinter as tk
 from tkinter import ttk
@@ -26,9 +30,15 @@ from europa.config import GridConfig, ModelConfig
 from europa.grid import make_grid
 from europa.transforms import sh_forward, sh_inverse
 from europa.simulation import Simulation
-from europa.solvers import _flatten_lm, _unflatten_lm, toroidal_e_from_radial_b, _build_self_field_diag
+from europa.solvers import (
+    _flatten_lm,
+    _unflatten_lm,
+    _build_self_field_diag,
+    toroidal_e_from_radial_b,
+    solve_uniform_first_order_sim,
+    solve_uniform_self_consistent_sim,
+)
 from europa.solver_variants.solver_variant_precomputed import (
-    solve_spectral_self_consistent_sim_precomputed,
     _build_mixing_matrix_precomputed_sparse,
 )
 from europa import inductance
@@ -38,8 +48,8 @@ from render_phasor_maps import _build_mesh
 from gaunt.assemble_gaunt_checkpoints import assemble_in_memory
 from phasor_data import PhasorSimulation
 
-STATE_DIR = Path("artifacts/workflow")
-FIG_DIR = Path("figures")
+STATE_DIR = Path("artifacts/uniform_workflow")
+FIG_DIR = Path("figures/uniform")
 GAUNT_CACHE = Path("data/gaunt_cache_wigxjpf")
 
 
@@ -49,21 +59,6 @@ def _log(text_widget: tk.Text, msg: str) -> None:
     text_widget.update_idletasks()
 
 
-def _checkerboard_admittance(positions: torch.Tensor, sigma_low: float, sigma_high: float, divisions: int) -> torch.Tensor:
-    """Assign a checkerboard pattern over (theta, phi) using subdivision-style divisions."""
-    x, y, z = positions[:, 0], positions[:, 1], positions[:, 2]
-    r = torch.linalg.norm(positions, dim=1)
-    theta = torch.acos(torch.clamp(z / r, -1.0, 1.0))  # [0, pi]
-    phi = torch.atan2(y, x)
-    phi = torch.remainder(phi, 2 * math.pi)  # [0, 2pi)
-
-    div_level = max(1, int(divisions))
-    # Map subdivision level -> bins per axis: 1->1, 2->2, 3->4, 4->8, ...
-    div = 1 if div_level <= 1 else 2 ** (div_level - 1)
-    theta_bin = torch.floor(theta / (math.pi / div))
-    phi_bin = torch.floor(phi / (2 * math.pi / div))
-    parity = (theta_bin + phi_bin).to(torch.int64) % 2
-    return torch.where(parity == 0, torch.full_like(theta, sigma_low), torch.full_like(theta, sigma_high))
 
 
 def _subdivisions_from_faces(target_faces: int) -> int:
@@ -150,15 +145,28 @@ def _complex_sheet_admittance(
     return Y.to(torch.complex128)
 
 
-def step1_build_grid_admittance(subdiv: int, lmax: int, checker_divisions: int, log) -> Path:
+def _uniformize_spectral_admittance(Y_s: torch.Tensor) -> torch.Tensor:
+    """Keep only the l=0, m=0 admittance coefficient (force perfectly uniform Y_s)."""
+    Y = torch.zeros_like(Y_s)
+    lmax = Y_s.shape[0] - 1
+    Y[0, lmax] = Y_s[0, lmax]
+    return Y
+
+
+def step1_build_grid_uniform_admittance(subdiv: int, lmax: int, log) -> Path:
     subdiv = max(0, int(subdiv))
     actual_faces = _faces_for_subdiv(subdiv)
     nside = _nside_from_subdivisions(subdiv)
     grid_cfg = GridConfig(nside=nside, lmax=lmax, radius_m=1.56e6, device="cpu")
     grid = make_grid(grid_cfg)
     sigma_2d_max = 2.0 * grid_cfg.seawater_conductivity_s_per_m * grid_cfg.ocean_thickness_m
-    cond_real = _checkerboard_admittance(grid.positions.to(torch.float64), 0.0, sigma_2d_max, checker_divisions)
     omega = 2.0 * math.pi / (9.925 * 3600.0)
+    cond_real = torch.full(
+        (grid.positions.shape[0],),
+        float(sigma_2d_max),
+        dtype=torch.float64,
+        device=grid.positions.device,
+    )
     cond = _complex_sheet_admittance(cond_real, omega, grid_cfg.radius_m)
     Y_s = sh_forward(cond, grid.positions.to(torch.float64), lmax=grid_cfg.lmax, weights=grid.areas.to(torch.float64))
     state = {
@@ -167,14 +175,15 @@ def step1_build_grid_admittance(subdiv: int, lmax: int, checker_divisions: int, 
         "normals": grid.normals,
         "areas": grid.areas,
         "neighbors": grid.neighbors,
+        "admittance_uniform": cond[0].clone().detach(),
         "admittance_spectral": Y_s,
         "admittance_grid": cond,
         "sigma_2d_max": sigma_2d_max,
-        "checker_divisions": checker_divisions,
+        "omega": omega,
         "subdivisions": subdiv,
     }
     path = _save_state("grid_admittance.pt", state)
-    log(f"Step 1 complete (subdivisions={subdiv}, faces={grid.positions.shape[0]}). Saved grid+admittance to {path}")
+    log(f"Step 1 complete (uniform admittance, subdivisions={subdiv}, faces={grid.positions.shape[0]}). Saved grid to {path}")
     return path, subdiv, int(grid.positions.shape[0]), actual_faces
 
 
@@ -408,17 +417,38 @@ def _build_phasor_base(state) -> PhasorSimulation:
         model=model,
         grid=grid_ns,
         solver_variant="",
+        admittance_uniform=state.get("admittance_uniform"),
         admittance_spectral=state["admittance_spectral"],
         B_radial=state["B_radial_spec"],
         period_sec=state["period_sec"],
     )
 
 
-def step3_solve_currents(first_order_only: bool, log) -> Path:
-    state = _load_state("ambient.pt")
-    grid_cfg: GridConfig = state["grid_cfg"]
-    base = _build_phasor_base(state)
+def _log_matrix_diagnostics(name: str, A: torch.Tensor, log) -> None:
+    with torch.no_grad():
+        A = A.to(torch.complex128)
+        max_abs = float(A.abs().max().item())
+        log(f"{name}: shape={tuple(A.shape)}, max|A|={max_abs:.3e}")
+        try:
+            s = torch.linalg.svdvals(A)
+            s_max = float(s.max().item())
+            s_min = float(s.min().item())
+            cond = float(s_max / s_min) if s_min != 0.0 else float("inf")
+            log(f"{name}: svd s_max={s_max:.3e}, s_min={s_min:.3e}, cond={cond:.3e}")
+        except Exception as exc:  # noqa: BLE001
+            log(f"{name}: svdvals failed: {exc}")
 
+
+def _matrix_condition(A: torch.Tensor) -> float:
+    with torch.no_grad():
+        s = torch.linalg.svdvals(A)
+        s_max = float(s.max().item())
+        s_min = float(s.min().item())
+        return float(s_max / s_min) if s_min != 0.0 else float("inf")
+
+
+def _build_mixing_matrix(state, log) -> torch.Tensor:
+    grid_cfg: GridConfig = state["grid_cfg"]
     log(f"Assembling Gaunt tensor from {GAUNT_CACHE} (lmax_limit={grid_cfg.lmax})...")
     G_sparse, gaunt_meta = assemble_in_memory(
         cache_dir=GAUNT_CACHE,
@@ -433,125 +463,97 @@ def step3_solve_currents(first_order_only: bool, log) -> Path:
             f"Gaunt cache incomplete: complete_L={complete_L}, required lmax={grid_cfg.lmax}. "
             "Rebuild the Gaunt cache to at least the requested lmax or lower lmax."
         )
-
     log("Building sparse mixing matrix...")
-    mixing_matrix = _build_mixing_matrix_precomputed_sparse(
-        grid_cfg.lmax, base.omega, base.radius_m, base.admittance_spectral, G_sparse
+    Y_s_uniform = _uniformize_spectral_admittance(state["admittance_spectral"])
+    return _build_mixing_matrix_precomputed_sparse(
+        grid_cfg.lmax,
+        state["ambient_cfg"].omega_jovian,
+        float(state["grid_cfg"].radius_m),
+        Y_s_uniform,
+        G_sparse,
     )
 
-    def _log_matrix_diagnostics(name: str, A: torch.Tensor) -> None:
-        with torch.no_grad():
-            A = A.to(torch.complex128)
-            max_abs = float(A.abs().max().item())
-            log(f"{name}: shape={tuple(A.shape)}, max|A|={max_abs:.3e}")
-            try:
-                s = torch.linalg.svdvals(A)
-                s_max = float(s.max().item())
-                s_min = float(s.min().item())
-                cond = float(s_max / s_min) if s_min != 0.0 else float("inf")
-                log(f"{name}: svd s_max={s_max:.3e}, s_min={s_min:.3e}, cond={cond:.3e}")
-            except Exception as exc:  # noqa: BLE001
-                log(f"{name}: svdvals failed: {exc}")
 
-    def _matrix_condition(A: torch.Tensor) -> float:
-        with torch.no_grad():
-            s = torch.linalg.svdvals(A)
-            s_max = float(s.max().item())
-            s_min = float(s.min().item())
-            return float(s_max / s_min) if s_min != 0.0 else float("inf")
+def step3_uniform_first_order(log) -> Path:
+    state = _load_state("ambient.pt")
+    sim_out = _build_phasor_base(state)
+    log("Uniform first-order solve...")
+    sim_out = solve_uniform_first_order_sim(sim_out)
+    payload = {"label": "uniform_first_order", "phasor_sim": sim_out}
+    path = _save_state("solution_uniform_first_order.pt", payload)
+    log(f"Step 3 complete. Saved uniform first-order solution to {path}")
+    return path
 
-    def _log_vec_diagnostics(name: str, v: torch.Tensor) -> None:
-        with torch.no_grad():
-            max_abs = float(v.abs().max().item())
-            any_nan = bool(torch.isnan(v).any().item())
-            any_inf = bool(torch.isinf(v).any().item())
-            log(f"{name}: max|v|={max_abs:.3e}, has_nan={any_nan}, has_inf={any_inf}")
 
-    def _log_kl_power(label: str, K_tor: torch.Tensor) -> None:
-        with torch.no_grad():
-            K = K_tor.to(torch.complex128)
-            lmax = K.shape[-2] - 1
-            power = []
-            for l in range(lmax + 1):
-                row = K[l]
-                power.append(float((row.abs() ** 2).sum().item()))
-            total = sum(power) if power else 0.0
-            if total <= 0.0:
-                log(f"{label}: total power=0 (no currents).")
-                return
-            top = sorted(range(len(power)), key=lambda i: power[i], reverse=True)[:6]
-            top_str = ", ".join([f"l={i}:{power[i]/total:.2%}" for i in top])
-            log(f"{label}: total power={total:.3e}, top l fractions: {top_str}")
+def step3_uniform_self_consistent(log) -> Path:
+    state = _load_state("ambient.pt")
+    sim_out = _build_phasor_base(state)
+    log("Uniform self-consistent solve...")
+    sim_out = solve_uniform_self_consistent_sim(sim_out)
+    payload = {"label": "uniform_self_consistent", "phasor_sim": sim_out}
+    path = _save_state("solution_uniform_self_consistent.pt", payload)
+    log(f"Step 3 complete. Saved uniform self-consistent solution to {path}")
+    return path
 
+
+def step4_spectral_first_order(log) -> Path:
+    state = _load_state("ambient.pt")
+    grid_cfg: GridConfig = state["grid_cfg"]
+    base = _build_phasor_base(state)
+    mixing_matrix = _build_mixing_matrix(state, log)
+    log("Spectral first-order solve...")
     sim_out = PhasorSimulation.from_serializable(base.to_serializable())
-    if first_order_only:
-        log("Solving first-order currents (no feedback)...")
-        sim_out.E_toroidal = toroidal_e_from_radial_b(sim_out.B_radial, sim_out.omega, sim_out.radius_m)
-        b_flat = _flatten_lm(sim_out.B_radial.to(torch.complex128))
-        k_flat = mixing_matrix @ b_flat
-        _log_vec_diagnostics("b_ext_flat", b_flat)
-        _log_vec_diagnostics("k_flat (first_order)", k_flat)
-        sim_out.K_toroidal = _unflatten_lm(k_flat, grid_cfg.lmax)
-        # Toroidal l=0 is unphysical; explicitly zero to avoid numerical leakage.
-        sim_out.K_toroidal[0, :] = 0.0
-        _log_kl_power("K_tor (first_order)", sim_out.K_toroidal)
-        sim_out.K_poloidal = torch.zeros_like(sim_out.K_toroidal)
-        sim_out.B_tor_emit, sim_out.B_pol_emit, sim_out.B_rad_emit = inductance.spectral_b_from_surface_currents(
-            sim_out.K_toroidal, sim_out.K_poloidal, radius=sim_out.radius_m
+    sim_out.E_toroidal = toroidal_e_from_radial_b(sim_out.B_radial, sim_out.omega, sim_out.radius_m)
+    b_flat = _flatten_lm(sim_out.B_radial.to(torch.complex128))
+    k_flat = mixing_matrix @ b_flat
+    sim_out.K_toroidal = _unflatten_lm(k_flat, grid_cfg.lmax)
+    sim_out.K_toroidal[0, :] = 0.0
+    sim_out.K_poloidal = torch.zeros_like(sim_out.K_toroidal)
+    sim_out.B_tor_emit, sim_out.B_pol_emit, sim_out.B_rad_emit = inductance.spectral_b_from_surface_currents(
+        sim_out.K_toroidal, sim_out.K_poloidal, radius=sim_out.radius_m
+    )
+    src_energy = float((sim_out.B_radial.abs() ** 2).sum().item())
+    resp_energy = float((sim_out.B_rad_emit.abs() ** 2).sum().item())
+    if resp_energy > src_energy:
+        raise RuntimeError(
+            f"Spectral first-order response energy exceeds source energy: "
+            f"resp={resp_energy:.3e} > src={src_energy:.3e}."
         )
-        src_energy = float((sim_out.B_radial.abs() ** 2).sum().item())
-        resp_energy = float((sim_out.B_rad_emit.abs() ** 2).sum().item())
-        if resp_energy > src_energy:
-            raise RuntimeError(
-                f"First-order response energy exceeds source energy: "
-                f"resp={resp_energy:.3e} > src={src_energy:.3e}."
-            )
-        sim_out.solver_variant = "spectral_first_order_precomputed_gaunt_sparse"
-        label = "first_order"
-    else:
-        log("Solving self-consistent system (matrix inversion)...")
-        sim_out.E_toroidal = toroidal_e_from_radial_b(sim_out.B_radial, sim_out.omega, sim_out.radius_m)
-        b_ext_flat = _flatten_lm(sim_out.B_radial.to(torch.complex128))
-        S_diag = _build_self_field_diag(grid_cfg.lmax, sim_out.grid_positions.device, torch.complex128)
-        I = torch.eye(mixing_matrix.shape[0], device=mixing_matrix.device, dtype=torch.complex128)
-        A = I - torch.diag(S_diag) @ mixing_matrix
-        _log_vec_diagnostics("b_ext_flat", b_ext_flat)
-        _log_matrix_diagnostics("M (mixing_matrix)", mixing_matrix)
-        _log_matrix_diagnostics("A (I - S*M)", A)
-        try:
-            cond = _matrix_condition(A)
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"Condition check failed: {exc}") from exc
-        if not np.isfinite(cond) or cond > 1e8:
-            raise RuntimeError(f"Ill-conditioned A (cond={cond:.3e}); aborting self-consistent solve.")
-        try:
-            b_tot = torch.linalg.solve(A, b_ext_flat)
-        except Exception as exc:  # noqa: BLE001
-            log(f"Linear solve failed: {exc}")
-            raise
-        k_flat = mixing_matrix @ b_tot
-        _log_vec_diagnostics("b_tot (self_consistent)", b_tot)
-        _log_vec_diagnostics("k_flat (self_consistent)", k_flat)
-        sim_out.K_toroidal = _unflatten_lm(k_flat, grid_cfg.lmax)
-        # Toroidal l=0 is unphysical; explicitly zero to avoid numerical leakage.
-        sim_out.K_toroidal[0, :] = 0.0
-        _log_kl_power("K_tor (self_consistent)", sim_out.K_toroidal)
-        sim_out.K_poloidal = torch.zeros_like(sim_out.K_toroidal)
-        sim_out.B_tor_emit, sim_out.B_pol_emit, sim_out.B_rad_emit = inductance.spectral_b_from_surface_currents(
-            sim_out.K_toroidal, sim_out.K_poloidal, radius=sim_out.radius_m
-        )
-        sim_out.solver_variant = "spectral_self_consistent_precomputed_gaunt_sparse"
-        sim_out.solver_variant = "spectral_self_consistent_precomputed_gaunt_sparse"
-        label = "self_consistent"
-        log("Self-consistent solve complete.")
+    sim_out.solver_variant = "spectral_first_order_precomputed_gaunt_sparse"
+    payload = {"label": "spectral_first_order", "phasor_sim": sim_out}
+    path = _save_state("solution_spectral_first_order.pt", payload)
+    log(f"Step 4 complete. Saved spectral first-order solution to {path}")
+    return path
 
-    payload = {
-        "label": label,
-        "phasor_sim": sim_out,
-    }
-    path = _save_state(f"solution_{label}.pt", payload)
-    _save_state("solution_latest.pt", payload)
-    log(f"Step 3 complete. Saved solution to {path}")
+
+def step5_spectral_self_consistent(log) -> Path:
+    state = _load_state("ambient.pt")
+    grid_cfg: GridConfig = state["grid_cfg"]
+    base = _build_phasor_base(state)
+    mixing_matrix = _build_mixing_matrix(state, log)
+    log("Spectral self-consistent solve...")
+    sim_out = PhasorSimulation.from_serializable(base.to_serializable())
+    sim_out.E_toroidal = toroidal_e_from_radial_b(sim_out.B_radial, sim_out.omega, sim_out.radius_m)
+    b_ext_flat = _flatten_lm(sim_out.B_radial.to(torch.complex128))
+    S_diag = _build_self_field_diag(grid_cfg.lmax, sim_out.grid_positions.device, torch.complex128)
+    I = torch.eye(mixing_matrix.shape[0], device=mixing_matrix.device, dtype=torch.complex128)
+    A = I - torch.diag(S_diag) @ mixing_matrix
+    _log_matrix_diagnostics("A (I - S*M)", A, log)
+    cond = _matrix_condition(A)
+    if not np.isfinite(cond) or cond > 1e8:
+        raise RuntimeError(f"Ill-conditioned A (cond={cond:.3e}); aborting spectral self-consistent solve.")
+    b_tot = torch.linalg.solve(A, b_ext_flat)
+    k_flat = mixing_matrix @ b_tot
+    sim_out.K_toroidal = _unflatten_lm(k_flat, grid_cfg.lmax)
+    sim_out.K_toroidal[0, :] = 0.0
+    sim_out.K_poloidal = torch.zeros_like(sim_out.K_toroidal)
+    sim_out.B_tor_emit, sim_out.B_pol_emit, sim_out.B_rad_emit = inductance.spectral_b_from_surface_currents(
+        sim_out.K_toroidal, sim_out.K_poloidal, radius=sim_out.radius_m
+    )
+    sim_out.solver_variant = "spectral_self_consistent_precomputed_gaunt_sparse"
+    payload = {"label": "spectral_self_consistent", "phasor_sim": sim_out}
+    path = _save_state("solution_spectral_self_consistent.pt", payload)
+    log(f"Step 5 complete. Saved spectral self-consistent solution to {path}")
     return path
 
 
@@ -570,8 +572,8 @@ def step4_render_overview(label: str, log) -> Path:
     grid_state = _load_state("grid_admittance.pt")
     subdivisions = int(grid_state["subdivisions"])
     FIG_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = FIG_DIR / f"nonuniform_{label}_overview.png"
-    log(f"Step 4 overview: label={label}, lmax={sim_out.lmax}, subdivisions={subdivisions}")
+    out_path = FIG_DIR / f"uniform_{label}_overview.png"
+    log(f"Overview: label={label}, lmax={sim_out.lmax}, subdivisions={subdivisions}")
     log("Step 4 overview: assembling input state for renderer...")
     t0 = time.perf_counter()
     render_demo_overview(
@@ -593,7 +595,7 @@ def step4_render_gradient(label: str, altitude_m: float, log) -> Path:
     subdivisions = int(grid_state["subdivisions"])
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     title = f"RSS |grad_B_emit| at alt={altitude_m/1000:.0f} km"
-    save_path = FIG_DIR / f"nonuniform_grad_{int(altitude_m):d}m_{label}.png"
+    save_path = FIG_DIR / f"uniform_grad_{int(altitude_m):d}m_{label}.png"
     render_gradient_map(sim_out, altitude_m=altitude_m, subdivisions=subdivisions, save_path=str(save_path), title=title)
     log(f"Rendered gradient map to {save_path}")
     return save_path
@@ -607,30 +609,11 @@ def _clear_outputs(log) -> None:
     log(f"Cleared outputs in {FIG_DIR} and {STATE_DIR}.")
 
 
-def step6_iterative_solve(order: int, log) -> Path:
+def step6_spectral_iterative(order: int, log) -> Path:
     state = _load_state("ambient.pt")
     grid_cfg: GridConfig = state["grid_cfg"]
     base = _build_phasor_base(state)
-
-    log(f"Assembling Gaunt tensor from {GAUNT_CACHE} (lmax_limit={grid_cfg.lmax})...")
-    G_sparse, gaunt_meta = assemble_in_memory(
-        cache_dir=GAUNT_CACHE,
-        lmax_limit=grid_cfg.lmax,
-        verbose=True,
-        plot=False,
-    )
-    complete_L = gaunt_meta.get("complete_L")
-    log(f"Gaunt tensor nnz={G_sparse._nnz()}, complete_L={complete_L}")
-    if complete_L is None or int(complete_L) < grid_cfg.lmax:
-        raise RuntimeError(
-            f"Gaunt cache incomplete: complete_L={complete_L}, required lmax={grid_cfg.lmax}. "
-            "Rebuild the Gaunt cache to at least the requested lmax or lower lmax."
-        )
-
-    log("Building sparse mixing matrix...")
-    mixing_matrix = _build_mixing_matrix_precomputed_sparse(
-        grid_cfg.lmax, base.omega, base.radius_m, base.admittance_spectral, G_sparse
-    )
+    mixing_matrix = _build_mixing_matrix(state, log)
 
     sim_out = PhasorSimulation.from_serializable(base.to_serializable())
     sim_out.E_toroidal = toroidal_e_from_radial_b(sim_out.B_radial, sim_out.omega, sim_out.radius_m)
@@ -666,20 +649,54 @@ def step6_iterative_solve(order: int, log) -> Path:
         sim_out.K_toroidal, sim_out.K_poloidal, radius=sim_out.radius_m
     )
     sim_out.solver_variant = "spectral_iterative_series"
-    label = "iterative"
+    label = "spectral_iterative"
 
     payload = {
         "label": label,
         "phasor_sim": sim_out,
     }
-    path = _save_state("solution_iterative.pt", payload)
-    log(f"Step 6 complete. Saved iterative solution to {path}")
+    path = _save_state("solution_spectral_iterative.pt", payload)
+    log(f"Step 6 complete. Saved spectral iterative solution to {path}")
     return path
+
+
+def step7_compare_to_uniform_first_order(log) -> None:
+    def _rel_error(a: torch.Tensor, b: torch.Tensor) -> float:
+        diff = (a - b).reshape(-1)
+        denom = b.reshape(-1)
+        num = float(torch.linalg.norm(diff).item())
+        den = float(torch.linalg.norm(denom).item())
+        return float("inf") if den == 0.0 else num / den
+
+    ref_payload = _load_solution("uniform_first_order")
+    ref = ref_payload["phasor_sim"]
+    if ref.K_toroidal is None or ref.B_rad_emit is None:
+        raise RuntimeError("Uniform first-order solution missing currents or emitted field.")
+
+    candidates = [
+        "uniform_self_consistent",
+        "spectral_first_order",
+        "spectral_self_consistent",
+        "spectral_iterative",
+    ]
+    for label in candidates:
+        path = STATE_DIR / f"solution_{label}.pt"
+        if not path.exists():
+            log(f"Compare: missing {label} (no solution file).")
+            continue
+        payload = _load_solution(label)
+        sim = payload["phasor_sim"]
+        if sim.K_toroidal is None or sim.B_rad_emit is None:
+            log(f"Compare: {label} missing K_toroidal or B_rad_emit.")
+            continue
+        k_err = _rel_error(sim.K_toroidal.to(torch.complex128), ref.K_toroidal.to(torch.complex128))
+        b_err = _rel_error(sim.B_rad_emit.to(torch.complex128), ref.B_rad_emit.to(torch.complex128))
+        log(f"Compare vs uniform first-order: {label} -> rel_err K_tor={k_err:.3e}, B_rad={b_err:.3e}")
 
 
 def main():
     root = tk.Tk()
-    root.title("Non-uniform Demo Workflow")
+    root.title("Uniform vs Spectral Workflow")
 
     frm = ttk.Frame(root, padding=10)
     frm.grid(row=0, column=0, sticky="nsew")
@@ -688,7 +705,7 @@ def main():
 
     # Log output (placed early so lambdas can close over it)
     log_widget = tk.Text(frm, height=18, width=120)
-    log_widget.grid(row=9, column=0, columnspan=10, pady=8, sticky="nsew")
+    log_widget.grid(row=11, column=0, columnspan=10, pady=8, sticky="nsew")
 
     def run_step(button: tk.Button, task, on_success=None):
         """Run a task in a thread, coloring the button yellow while running, green on success, red on error."""
@@ -757,27 +774,38 @@ def main():
     def _update_button_states() -> None:
         grid_ok = _grid_exists()
         ambient_ok = _ambient_exists()
-        first_ok = _solution_exists("first_order")
-        self_ok = _solution_exists("self_consistent")
-        iter_ok = _solution_exists("iterative")
+        uniform_first_ok = _solution_exists("uniform_first_order")
+        uniform_self_ok = _solution_exists("uniform_self_consistent")
+        spectral_first_ok = _solution_exists("spectral_first_order")
+        spectral_self_ok = _solution_exists("spectral_self_consistent")
+        spectral_iter_ok = _solution_exists("spectral_iterative")
         _set_button_state(btn_step1b, grid_ok)
         _set_button_state(btn_step1c, grid_ok)
         _set_button_state(btn_step2, grid_ok)
-        _set_button_state(btn_step4_first, ambient_ok)
-        _set_button_state(btn_step5_self, ambient_ok)
-        _set_button_state(btn_step6_iter, ambient_ok)
-        _set_button_state(btn_overview_first, first_ok)
-        _set_button_state(btn_grad0_first, first_ok)
-        _set_button_state(btn_grad100_first, first_ok)
-        _set_button_state(btn_overview_self, self_ok)
-        _set_button_state(btn_grad0_self, self_ok)
-        _set_button_state(btn_grad100_self, self_ok)
-        _set_button_state(btn_overview_iter, iter_ok)
-        _set_button_state(btn_grad0_iter, iter_ok)
-        _set_button_state(btn_grad100_iter, iter_ok)
+        _set_button_state(btn_step3_uniform_first, ambient_ok)
+        _set_button_state(btn_step3_uniform_self, ambient_ok)
+        _set_button_state(btn_step4_spectral_first, ambient_ok)
+        _set_button_state(btn_step5_spectral_self, ambient_ok)
+        _set_button_state(btn_step6_spectral_iter, ambient_ok)
+        _set_button_state(btn_overview_uniform_first, uniform_first_ok)
+        _set_button_state(btn_grad0_uniform_first, uniform_first_ok)
+        _set_button_state(btn_grad100_uniform_first, uniform_first_ok)
+        _set_button_state(btn_overview_uniform_self, uniform_self_ok)
+        _set_button_state(btn_grad0_uniform_self, uniform_self_ok)
+        _set_button_state(btn_grad100_uniform_self, uniform_self_ok)
+        _set_button_state(btn_overview_spectral_first, spectral_first_ok)
+        _set_button_state(btn_grad0_spectral_first, spectral_first_ok)
+        _set_button_state(btn_grad100_spectral_first, spectral_first_ok)
+        _set_button_state(btn_overview_spectral_self, spectral_self_ok)
+        _set_button_state(btn_grad0_spectral_self, spectral_self_ok)
+        _set_button_state(btn_grad100_spectral_self, spectral_self_ok)
+        _set_button_state(btn_overview_spectral_iter, spectral_iter_ok)
+        _set_button_state(btn_grad0_spectral_iter, spectral_iter_ok)
+        _set_button_state(btn_grad100_spectral_iter, spectral_iter_ok)
+        _set_button_state(btn_step7_compare, uniform_first_ok)
 
     # Inputs for step 1
-    ttk.Label(frm, text="Step 1: Grid + admittance").grid(row=1, column=0, sticky="w")
+    ttk.Label(frm, text="Step 1: Grid + uniform admittance").grid(row=1, column=0, sticky="w")
     ttk.Label(frm, text="effective subdivisions").grid(row=1, column=1, sticky="e")
     subdiv_var = tk.StringVar(value="3")
     ttk.Entry(frm, textvariable=subdiv_var, width=8).grid(row=1, column=2, sticky="w")
@@ -792,12 +820,12 @@ def main():
     ttk.Label(frm, text="lmax").grid(row=1, column=7, sticky="e")
     lmax_var = tk.StringVar(value="35")
     ttk.Entry(frm, textvariable=lmax_var, width=6).grid(row=1, column=8, sticky="w")
-    ttk.Label(frm, text="checker subdivisions (1->1, 2->2, 3->4)").grid(row=1, column=9, sticky="e")
-    div_var = tk.StringVar(value="2")
-    ttk.Entry(frm, textvariable=div_var, width=6).grid(row=1, column=10, sticky="w")
     sh_count_var = tk.StringVar(value="1296")
-    ttk.Label(frm, text="# SH coeffs=").grid(row=1, column=11, sticky="e")
-    ttk.Label(frm, textvariable=sh_count_var).grid(row=1, column=12, sticky="w")
+    ttk.Label(frm, text="# SH coeffs=").grid(row=1, column=9, sticky="e")
+    ttk.Label(frm, textvariable=sh_count_var).grid(row=1, column=10, sticky="w")
+    ttk.Label(frm, text="iter order").grid(row=1, column=11, sticky="e")
+    iter_order_var = tk.StringVar(value="3")
+    ttk.Entry(frm, textvariable=iter_order_var, width=6).grid(row=1, column=12, sticky="w")
     btn_l_from_faces = tk.Button(
         frm,
         text="Set lmax from faces",
@@ -823,10 +851,9 @@ def main():
         text="Run Step 1",
         command=lambda: run_step(
             btn_step1,
-            lambda: step1_build_grid_admittance(
+            lambda: step1_build_grid_uniform_admittance(
                 int(subdiv_var.get()),
                 int(lmax_var.get()),
-                int(div_var.get()),
                 lambda msg: _log(log_widget, msg),
             ),
             on_success=lambda res: (
@@ -840,9 +867,6 @@ def main():
         ),
     )
     btn_step1.grid(row=1, column=14, padx=6)
-    ttk.Label(frm, text="iter order").grid(row=1, column=15, sticky="e")
-    iter_order_var = tk.StringVar(value="3")
-    ttk.Entry(frm, textvariable=iter_order_var, width=6).grid(row=1, column=16, sticky="w")
 
     # Step 1b
     ttk.Label(frm, text="Step 1b: Roundtrip check").grid(row=2, column=0, sticky="w")
@@ -871,124 +895,213 @@ def main():
     )
     btn_step2.grid(row=4, column=13, padx=6)
 
-    # Step 4: First-order solve + plots
-    ttk.Label(frm, text="Step 4: First-order solve").grid(row=5, column=0, sticky="w")
-    btn_step4_first = tk.Button(
+    # Step 3: Uniform solves + plots
+    ttk.Label(frm, text="Step 3: Uniform first-order").grid(row=5, column=0, sticky="w")
+    btn_step3_uniform_first = tk.Button(
         frm,
-        text="Solve first-order",
+        text="Solve uniform first-order",
         command=lambda: run_step(
-            btn_step4_first,
-            lambda: step3_solve_currents(True, lambda msg: _log(log_widget, msg)),
+            btn_step3_uniform_first,
+            lambda: step3_uniform_first_order(lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step4_first.grid(row=5, column=13, padx=4, sticky="w")
-    btn_overview_first = tk.Button(
+    btn_step3_uniform_first.grid(row=5, column=13, padx=4, sticky="w")
+    btn_overview_uniform_first = tk.Button(
         frm,
-        text="Overview (first-order)",
+        text="Overview (uniform first-order)",
         command=lambda: run_step_ui(
-            btn_overview_first,
-            lambda: step4_render_overview("first_order", lambda msg: _log(log_widget, msg)),
+            btn_overview_uniform_first,
+            lambda: step4_render_overview("uniform_first_order", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_first.grid(row=5, column=14, padx=4, sticky="w")
-    btn_grad0_first = tk.Button(
+    btn_overview_uniform_first.grid(row=5, column=14, padx=4, sticky="w")
+    btn_grad0_uniform_first = tk.Button(
         frm,
-        text="Gradients @ surface (first-order)",
+        text="Gradients @ surface (uniform first-order)",
         command=lambda: run_step_ui(
-            btn_grad0_first,
-            lambda: step4_render_gradient("first_order", 0.0, lambda msg: _log(log_widget, msg)),
+            btn_grad0_uniform_first,
+            lambda: step4_render_gradient("uniform_first_order", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_first.grid(row=5, column=15, padx=4, sticky="w")
-    btn_grad100_first = tk.Button(
+    btn_grad0_uniform_first.grid(row=5, column=15, padx=4, sticky="w")
+    btn_grad100_uniform_first = tk.Button(
         frm,
-        text="Gradients @ 100 km (first-order)",
+        text="Gradients @ 100 km (uniform first-order)",
         command=lambda: run_step_ui(
-            btn_grad100_first,
-            lambda: step4_render_gradient("first_order", 100e3, lambda msg: _log(log_widget, msg)),
+            btn_grad100_uniform_first,
+            lambda: step4_render_gradient("uniform_first_order", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_first.grid(row=5, column=16, padx=4, sticky="w")
+    btn_grad100_uniform_first.grid(row=5, column=16, padx=4, sticky="w")
 
-    # Step 5: Self-consistent solve + plots
-    ttk.Label(frm, text="Step 5: Self-consistent solve").grid(row=6, column=0, sticky="w")
-    btn_step5_self = tk.Button(
+    ttk.Label(frm, text="Step 3b: Uniform self-consistent").grid(row=6, column=0, sticky="w")
+    btn_step3_uniform_self = tk.Button(
         frm,
-        text="Solve self-consistent",
+        text="Solve uniform self-consistent",
         command=lambda: run_step(
-            btn_step5_self,
-            lambda: step3_solve_currents(False, lambda msg: _log(log_widget, msg)),
+            btn_step3_uniform_self,
+            lambda: step3_uniform_self_consistent(lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step5_self.grid(row=6, column=13, padx=4, sticky="w")
-    btn_overview_self = tk.Button(
+    btn_step3_uniform_self.grid(row=6, column=13, padx=4, sticky="w")
+    btn_overview_uniform_self = tk.Button(
         frm,
-        text="Overview (self-consistent)",
+        text="Overview (uniform self-consistent)",
         command=lambda: run_step_ui(
-            btn_overview_self,
-            lambda: step4_render_overview("self_consistent", lambda msg: _log(log_widget, msg)),
+            btn_overview_uniform_self,
+            lambda: step4_render_overview("uniform_self_consistent", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_self.grid(row=6, column=14, padx=4, sticky="w")
-    btn_grad0_self = tk.Button(
+    btn_overview_uniform_self.grid(row=6, column=14, padx=4, sticky="w")
+    btn_grad0_uniform_self = tk.Button(
         frm,
-        text="Gradients @ surface (self-consistent)",
+        text="Gradients @ surface (uniform self-consistent)",
         command=lambda: run_step_ui(
-            btn_grad0_self,
-            lambda: step4_render_gradient("self_consistent", 0.0, lambda msg: _log(log_widget, msg)),
+            btn_grad0_uniform_self,
+            lambda: step4_render_gradient("uniform_self_consistent", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_self.grid(row=6, column=15, padx=4, sticky="w")
-    btn_grad100_self = tk.Button(
+    btn_grad0_uniform_self.grid(row=6, column=15, padx=4, sticky="w")
+    btn_grad100_uniform_self = tk.Button(
         frm,
-        text="Gradients @ 100 km (self-consistent)",
+        text="Gradients @ 100 km (uniform self-consistent)",
         command=lambda: run_step_ui(
-            btn_grad100_self,
-            lambda: step4_render_gradient("self_consistent", 100e3, lambda msg: _log(log_widget, msg)),
+            btn_grad100_uniform_self,
+            lambda: step4_render_gradient("uniform_self_consistent", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_self.grid(row=6, column=16, padx=4, sticky="w")
+    btn_grad100_uniform_self.grid(row=6, column=16, padx=4, sticky="w")
 
-    # Step 6: Iterative series solve + plots
-    ttk.Label(frm, text="Step 6: Iterative solve").grid(row=7, column=0, sticky="w")
-    btn_step6_iter = tk.Button(
+    # Step 4: Spectral first-order + plots
+    ttk.Label(frm, text="Step 4: Spectral first-order").grid(row=7, column=0, sticky="w")
+    btn_step4_spectral_first = tk.Button(
         frm,
-        text="Solve iterative",
+        text="Solve spectral first-order",
         command=lambda: run_step(
-            btn_step6_iter,
-            lambda: step6_iterative_solve(int(iter_order_var.get()), lambda msg: _log(log_widget, msg)),
+            btn_step4_spectral_first,
+            lambda: step4_spectral_first_order(lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step6_iter.grid(row=7, column=13, padx=4, sticky="w")
-    btn_overview_iter = tk.Button(
+    btn_step4_spectral_first.grid(row=7, column=13, padx=4, sticky="w")
+    btn_overview_spectral_first = tk.Button(
         frm,
-        text="Overview (iterative)",
+        text="Overview (spectral first-order)",
         command=lambda: run_step_ui(
-            btn_overview_iter,
-            lambda: step4_render_overview("iterative", lambda msg: _log(log_widget, msg)),
+            btn_overview_spectral_first,
+            lambda: step4_render_overview("spectral_first_order", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_iter.grid(row=7, column=14, padx=4, sticky="w")
-    btn_grad0_iter = tk.Button(
+    btn_overview_spectral_first.grid(row=7, column=14, padx=4, sticky="w")
+    btn_grad0_spectral_first = tk.Button(
         frm,
-        text="Gradients @ surface (iterative)",
+        text="Gradients @ surface (spectral first-order)",
         command=lambda: run_step_ui(
-            btn_grad0_iter,
-            lambda: step4_render_gradient("iterative", 0.0, lambda msg: _log(log_widget, msg)),
+            btn_grad0_spectral_first,
+            lambda: step4_render_gradient("spectral_first_order", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_iter.grid(row=7, column=15, padx=4, sticky="w")
-    btn_grad100_iter = tk.Button(
+    btn_grad0_spectral_first.grid(row=7, column=15, padx=4, sticky="w")
+    btn_grad100_spectral_first = tk.Button(
         frm,
-        text="Gradients @ 100 km (iterative)",
+        text="Gradients @ 100 km (spectral first-order)",
         command=lambda: run_step_ui(
-            btn_grad100_iter,
-            lambda: step4_render_gradient("iterative", 100e3, lambda msg: _log(log_widget, msg)),
+            btn_grad100_spectral_first,
+            lambda: step4_render_gradient("spectral_first_order", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_iter.grid(row=7, column=16, padx=4, sticky="w")
+    btn_grad100_spectral_first.grid(row=7, column=16, padx=4, sticky="w")
 
-    frm.rowconfigure(9, weight=1)
+    # Step 5: Spectral self-consistent + plots
+    ttk.Label(frm, text="Step 5: Spectral self-consistent").grid(row=8, column=0, sticky="w")
+    btn_step5_spectral_self = tk.Button(
+        frm,
+        text="Solve spectral self-consistent",
+        command=lambda: run_step(
+            btn_step5_spectral_self,
+            lambda: step5_spectral_self_consistent(lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_step5_spectral_self.grid(row=8, column=13, padx=4, sticky="w")
+    btn_overview_spectral_self = tk.Button(
+        frm,
+        text="Overview (spectral self-consistent)",
+        command=lambda: run_step_ui(
+            btn_overview_spectral_self,
+            lambda: step4_render_overview("spectral_self_consistent", lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_overview_spectral_self.grid(row=8, column=14, padx=4, sticky="w")
+    btn_grad0_spectral_self = tk.Button(
+        frm,
+        text="Gradients @ surface (spectral self-consistent)",
+        command=lambda: run_step_ui(
+            btn_grad0_spectral_self,
+            lambda: step4_render_gradient("spectral_self_consistent", 0.0, lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_grad0_spectral_self.grid(row=8, column=15, padx=4, sticky="w")
+    btn_grad100_spectral_self = tk.Button(
+        frm,
+        text="Gradients @ 100 km (spectral self-consistent)",
+        command=lambda: run_step_ui(
+            btn_grad100_spectral_self,
+            lambda: step4_render_gradient("spectral_self_consistent", 100e3, lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_grad100_spectral_self.grid(row=8, column=16, padx=4, sticky="w")
+
+    # Step 6: Spectral iterative + plots
+    ttk.Label(frm, text="Step 6: Spectral iterative").grid(row=9, column=0, sticky="w")
+    btn_step6_spectral_iter = tk.Button(
+        frm,
+        text="Solve spectral iterative",
+        command=lambda: run_step(
+            btn_step6_spectral_iter,
+            lambda: step6_spectral_iterative(int(iter_order_var.get()), lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_step6_spectral_iter.grid(row=9, column=13, padx=4, sticky="w")
+    btn_overview_spectral_iter = tk.Button(
+        frm,
+        text="Overview (spectral iterative)",
+        command=lambda: run_step_ui(
+            btn_overview_spectral_iter,
+            lambda: step4_render_overview("spectral_iterative", lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_overview_spectral_iter.grid(row=9, column=14, padx=4, sticky="w")
+    btn_grad0_spectral_iter = tk.Button(
+        frm,
+        text="Gradients @ surface (spectral iterative)",
+        command=lambda: run_step_ui(
+            btn_grad0_spectral_iter,
+            lambda: step4_render_gradient("spectral_iterative", 0.0, lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_grad0_spectral_iter.grid(row=9, column=15, padx=4, sticky="w")
+    btn_grad100_spectral_iter = tk.Button(
+        frm,
+        text="Gradients @ 100 km (spectral iterative)",
+        command=lambda: run_step_ui(
+            btn_grad100_spectral_iter,
+            lambda: step4_render_gradient("spectral_iterative", 100e3, lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_grad100_spectral_iter.grid(row=9, column=16, padx=4, sticky="w")
+
+    # Step 7: Compare solves
+    ttk.Label(frm, text="Step 7: Compare to uniform first-order").grid(row=10, column=0, sticky="w")
+    btn_step7_compare = tk.Button(
+        frm,
+        text="Compare solutions",
+        command=lambda: run_step(
+            btn_step7_compare,
+            lambda: step7_compare_to_uniform_first_order(lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_step7_compare.grid(row=10, column=13, padx=4, sticky="w")
+
+    frm.rowconfigure(11, weight=1)
     frm.columnconfigure(17, weight=1)
 
     subdiv_var.trace_add("write", lambda *_: _update_lmax_button_color())
