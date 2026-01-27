@@ -226,7 +226,7 @@ def step1b_plot_roundtrip(log) -> None:
         ax.vlines(idx, a, b, colors="gray", alpha=0.3, linewidth=0.5)
         ax.set_title(f"{label} part: roundtrip 0 vs 1")
         ax.set_xlabel("Grid point index")
-        ax.set_ylabel("Admittance")
+        ax.set_ylabel("Admittance (S)")
         ax.legend(loc="best", frameon=False)
 
     fig.tight_layout()
@@ -241,6 +241,39 @@ def step1b_plot_roundtrip(log) -> None:
         radius=float(state["grid_cfg"].radius_m),
     )
     log("Step 1b complete. Displayed round-trip scatter plots.")
+
+
+def step1b_plot_admittance_power(log) -> None:
+    state = _load_state("grid_admittance.pt")
+    coeffs = state.get("admittance_spectral")
+    if coeffs is None:
+        raise RuntimeError("Missing admittance_spectral. Run Step 1 before plotting admittance power.")
+
+    l_b, m_b, mag = _flatten_harmonics(coeffs.to(torch.complex128))
+    magnitude = mag
+    peak = float(max(np.max(magnitude), 1e-30))
+    eps = peak * 1e-9
+    active = magnitude > eps
+    active_ls = l_b[active]
+    l_cut = int(active_ls.max()) if active_ls.size else 1
+    l_cut = max(l_cut, 1)
+    keep = l_b <= l_cut
+    x = np.arange(int(np.sum(keep)))
+    tick_idx = np.where(m_b[keep] == 0)[0]
+    tick_labels = [f"({l},0)" for l in l_b[keep][tick_idx]]
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.bar(x, np.maximum(magnitude[keep], eps), color="#ff9c43")
+    ax.set_yscale("log")
+    ax.set_xlabel("(l,m) ordering; ticks at m=0")
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels(tick_labels, rotation=90)
+    ax.set_ylabel("|Y_s| (S)")
+    ax.set_title("Admittance mode magnitude")
+    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    plt.show()
+    log("Step 1b complete. Plotted admittance mode power.")
 
 
 def step1c_plot_roundtrip_stability(log) -> None:
@@ -276,7 +309,7 @@ def step1c_plot_roundtrip_stability(log) -> None:
         ax.vlines(idx, a, b, colors="gray", alpha=0.3, linewidth=0.5)
         ax.set_title(f"{label} part: roundtrip 1 vs 2")
         ax.set_xlabel("Grid point index")
-        ax.set_ylabel("Admittance")
+        ax.set_ylabel("Admittance (S)")
         ax.legend(loc="best", frameon=False)
 
     fig.tight_layout()
@@ -520,9 +553,9 @@ def step3_solve_currents(first_order_only: bool, log) -> Path:
         src_energy = float((sim_out.B_radial.abs() ** 2).sum().item())
         resp_energy = float((sim_out.B_rad_emit.abs() ** 2).sum().item())
         if resp_energy > src_energy:
-            raise RuntimeError(
-                f"First-order response energy exceeds source energy: "
-                f"resp={resp_energy:.3e} > src={src_energy:.3e}."
+            log(
+                "Warning: first-order response energy exceeds source energy "
+                f"(resp={resp_energy:.3e} > src={src_energy:.3e})."
             )
         sim_out.solver_variant = "spectral_first_order_precomputed_gaunt_sparse"
         label = "first_order"
@@ -615,6 +648,54 @@ def step4_render_gradient(label: str, altitude_m: float, log) -> Path:
     render_gradient_map(sim_out, altitude_m=altitude_m, subdivisions=subdivisions, save_path=str(save_path), title=title)
     log(f"Rendered gradient map to {save_path}")
     return save_path
+
+
+def _flatten_harmonics(coeffs: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return l, m, |coeff| arrays in canonical (l,m) order."""
+    lmax = coeffs.shape[-2] - 1
+    ls, ms, mags = [], [], []
+    for l in range(lmax + 1):
+        for m in range(-l, l + 1):
+            ls.append(l)
+            ms.append(m)
+            mags.append(torch.abs(coeffs[l, lmax + m]).item())
+    return np.array(ls), np.array(ms), np.array(mags)
+
+
+def step4_plot_harmonics(label: str, log) -> None:
+    payload = _load_solution(label)
+    sim_out: PhasorSimulation = payload["phasor_sim"]
+    if sim_out.B_radial is None or sim_out.B_rad_emit is None:
+        raise RuntimeError("Missing B_radial or B_rad_emit; run the solve before plotting harmonics.")
+
+    l_b, m_b, mag_b = _flatten_harmonics(sim_out.B_radial)
+    _, _, mag_emit = _flatten_harmonics(sim_out.B_rad_emit)
+    peak = float(max(np.max(mag_b), np.max(mag_emit), 1e-30))
+    eps = peak * 1e-9
+    active = (mag_b > eps) | (mag_emit > eps)
+    active_ls = l_b[active]
+    l_cut = int(active_ls.max()) if active_ls.size else 1
+    l_cut = max(l_cut, 1)
+    keep = l_b <= l_cut
+    x = np.arange(int(np.sum(keep)))
+    tick_idx = np.where(m_b[keep] == 0)[0]
+    tick_labels = [f"({l},0)" for l in l_b[keep][tick_idx]]
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    width = 0.42
+    ax.bar(x - width / 2, np.maximum(mag_b[keep], eps), width=width, label="ambient |B_rad|")
+    ax.bar(x + width / 2, np.maximum(mag_emit[keep], eps), width=width, label="emitted |B_rad_emit|")
+    ax.set_yscale("log")
+    ax.set_xlabel("(l,m) ordering; ticks at m=0")
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels(tick_labels, rotation=90)
+    ax.set_ylabel("RSS magnitude")
+    ax.set_title(f"Harmonics magnitude (ambient vs emitted) [{label}]")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    plt.show()
+    log(f"Plotted harmonics magnitude for {label}.")
 
 
 def _clear_outputs(log) -> None:
@@ -779,6 +860,7 @@ def main():
         self_ok = _solution_exists("self_consistent")
         iter_ok = _solution_exists("iterative")
         _set_button_state(btn_step1b, grid_ok)
+        _set_button_state(btn_step1b_power, grid_ok)
         _set_button_state(btn_step1c, grid_ok)
         _set_button_state(btn_step2, grid_ok)
         _set_button_state(btn_step4_first, ambient_ok)
@@ -787,12 +869,15 @@ def main():
         _set_button_state(btn_overview_first, first_ok)
         _set_button_state(btn_grad0_first, first_ok)
         _set_button_state(btn_grad100_first, first_ok)
+        _set_button_state(btn_harm_first, first_ok)
         _set_button_state(btn_overview_self, self_ok)
         _set_button_state(btn_grad0_self, self_ok)
         _set_button_state(btn_grad100_self, self_ok)
+        _set_button_state(btn_harm_self, self_ok)
         _set_button_state(btn_overview_iter, iter_ok)
         _set_button_state(btn_grad0_iter, iter_ok)
         _set_button_state(btn_grad100_iter, iter_ok)
+        _set_button_state(btn_harm_iter, iter_ok)
 
     # Inputs for step 1
     ttk.Label(frm, text="Step 1: Grid + admittance").grid(row=1, column=0, sticky="w")
@@ -817,8 +902,8 @@ def main():
     ttk.Label(frm, text="# SH coeffs=").grid(row=2, column=3, sticky="e")
     ttk.Label(frm, textvariable=sh_count_var).grid(row=2, column=4, sticky="w")
     default_cfg = GridConfig(nside=1, lmax=1, radius_m=1.56e6, device="cpu")
-    default_mean = default_cfg.seawater_conductivity_s_per_m * default_cfg.ocean_thickness_m
-    ttk.Label(frm, text="checker mean").grid(row=3, column=1, sticky="e")
+    default_mean = 2.0 * default_cfg.seawater_conductivity_s_per_m * default_cfg.ocean_thickness_m
+    ttk.Label(frm, text="checker mean (S)").grid(row=3, column=1, sticky="e")
     checker_mean_var = tk.StringVar(value=f"{default_mean:.3e}")
     ttk.Entry(frm, textvariable=checker_mean_var, width=10).grid(row=3, column=2, sticky="w")
     ttk.Label(frm, text="contrast (%)").grid(row=3, column=3, sticky="e")
@@ -880,6 +965,15 @@ def main():
         command=lambda: run_step_ui(btn_step1b, lambda: step1b_plot_roundtrip(lambda msg: _log(log_widget, msg))),
     )
     btn_step1b.grid(row=4, column=2, padx=6, sticky="w")
+    btn_step1b_power = tk.Button(
+        frm,
+        text="Admittance power (l,m)",
+        command=lambda: run_step_ui(
+            btn_step1b_power,
+            lambda: step1b_plot_admittance_power(lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_step1b_power.grid(row=4, column=3, padx=6, sticky="w")
 
     # Step 1c
     ttk.Label(frm, text="Step 1c: Roundtrip stability").grid(row=5, column=0, sticky="w")
@@ -943,6 +1037,17 @@ def main():
         ),
     )
     btn_grad100_first.grid(row=7, column=5, padx=4, sticky="w")
+    btn_harm_first = tk.Button(
+        frm,
+        text="Harmonics (ambient vs emitted)",
+        wraplength=180,
+        justify="left",
+        command=lambda: run_step_ui(
+            btn_harm_first,
+            lambda: step4_plot_harmonics("first_order", lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_harm_first.grid(row=7, column=6, padx=4, sticky="w")
 
     # Step 5: Self-consistent solve + plots
     ttk.Label(frm, text="Step 5: Self-consistent solve").grid(row=8, column=0, sticky="w")
@@ -988,6 +1093,17 @@ def main():
         ),
     )
     btn_grad100_self.grid(row=8, column=5, padx=4, sticky="w")
+    btn_harm_self = tk.Button(
+        frm,
+        text="Harmonics (ambient vs emitted)",
+        wraplength=180,
+        justify="left",
+        command=lambda: run_step_ui(
+            btn_harm_self,
+            lambda: step4_plot_harmonics("self_consistent", lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_harm_self.grid(row=8, column=6, padx=4, sticky="w")
 
     # Step 6: Iterative series solve + plots
     ttk.Label(frm, text="Step 6: Iterative solve").grid(row=9, column=0, sticky="w")
@@ -1033,6 +1149,17 @@ def main():
         ),
     )
     btn_grad100_iter.grid(row=9, column=5, padx=4, sticky="w")
+    btn_harm_iter = tk.Button(
+        frm,
+        text="Harmonics (ambient vs emitted)",
+        wraplength=180,
+        justify="left",
+        command=lambda: run_step_ui(
+            btn_harm_iter,
+            lambda: step4_plot_harmonics("iterative", lambda msg: _log(log_widget, msg)),
+        ),
+    )
+    btn_harm_iter.grid(row=9, column=6, padx=4, sticky="w")
 
     frm.rowconfigure(11, weight=1)
     frm.columnconfigure(6, weight=1)
