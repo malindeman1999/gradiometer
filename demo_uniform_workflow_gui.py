@@ -704,8 +704,8 @@ def main():
     root.rowconfigure(0, weight=1)
 
     # Log output (placed early so lambdas can close over it)
-    log_widget = tk.Text(frm, height=18, width=120)
-    log_widget.grid(row=11, column=0, columnspan=10, pady=8, sticky="nsew")
+    log_widget = tk.Text(frm, height=18, width=45)
+    log_widget.grid(row=12, column=0, columnspan=10, pady=8, sticky="nsew")
 
     def run_step(button: tk.Button, task, on_success=None):
         """Run a task in a thread, coloring the button yellow while running, green on success, red on error."""
@@ -821,11 +821,11 @@ def main():
     lmax_var = tk.StringVar(value="35")
     ttk.Entry(frm, textvariable=lmax_var, width=6).grid(row=1, column=8, sticky="w")
     sh_count_var = tk.StringVar(value="1296")
-    ttk.Label(frm, text="# SH coeffs=").grid(row=1, column=9, sticky="e")
-    ttk.Label(frm, textvariable=sh_count_var).grid(row=1, column=10, sticky="w")
-    ttk.Label(frm, text="iter order").grid(row=1, column=11, sticky="e")
+    ttk.Label(frm, text="# SH coeffs=").grid(row=2, column=1, sticky="e")
+    ttk.Label(frm, textvariable=sh_count_var).grid(row=2, column=2, sticky="w")
+    ttk.Label(frm, text="iter order").grid(row=2, column=3, sticky="e")
     iter_order_var = tk.StringVar(value="3")
-    ttk.Entry(frm, textvariable=iter_order_var, width=6).grid(row=1, column=12, sticky="w")
+    ttk.Entry(frm, textvariable=iter_order_var, width=6).grid(row=2, column=4, sticky="w")
     btn_l_from_faces = tk.Button(
         frm,
         text="Set lmax from faces",
@@ -845,7 +845,7 @@ def main():
             _update_lmax_button_color(),
         ],
     )
-    btn_l_from_faces.grid(row=1, column=13, padx=4)
+    btn_l_from_faces.grid(row=2, column=5, padx=4, sticky="w")
     btn_step1 = tk.Button(
         frm,
         text="Run Step 1",
@@ -866,37 +866,37 @@ def main():
             ),
         ),
     )
-    btn_step1.grid(row=1, column=14, padx=6)
+    btn_step1.grid(row=1, column=3, padx=6, sticky="w")
 
     # Step 1b
-    ttk.Label(frm, text="Step 1b: Roundtrip check").grid(row=2, column=0, sticky="w")
+    ttk.Label(frm, text="Step 1b: Roundtrip check").grid(row=3, column=0, sticky="w")
     btn_step1b = tk.Button(
         frm,
         text="Plot admittance roundtrip",
         command=lambda: run_step_ui(btn_step1b, lambda: step1b_plot_roundtrip(lambda msg: _log(log_widget, msg))),
     )
-    btn_step1b.grid(row=2, column=13, padx=6)
+    btn_step1b.grid(row=3, column=2, padx=6, sticky="w")
 
     # Step 1c
-    ttk.Label(frm, text="Step 1c: Roundtrip stability").grid(row=3, column=0, sticky="w")
+    ttk.Label(frm, text="Step 1c: Roundtrip stability").grid(row=4, column=0, sticky="w")
     btn_step1c = tk.Button(
         frm,
         text="Plot roundtrip 1 vs 2",
         command=lambda: run_step_ui(btn_step1c, lambda: step1c_plot_roundtrip_stability(lambda msg: _log(log_widget, msg))),
     )
-    btn_step1c.grid(row=3, column=13, padx=6)
+    btn_step1c.grid(row=4, column=2, padx=6, sticky="w")
 
     # Step 2
-    ttk.Label(frm, text="Step 2: Ambient field").grid(row=4, column=0, sticky="w")
+    ttk.Label(frm, text="Step 2: Ambient field").grid(row=5, column=0, sticky="w")
     btn_step2 = tk.Button(
         frm,
         text="Build ambient",
         command=lambda: run_step(btn_step2, lambda: step2_build_ambient(lambda msg: _log(log_widget, msg))),
     )
-    btn_step2.grid(row=4, column=13, padx=6)
+    btn_step2.grid(row=5, column=2, padx=6, sticky="w")
 
     # Step 3: Uniform solves + plots
-    ttk.Label(frm, text="Step 3: Uniform first-order").grid(row=5, column=0, sticky="w")
+    ttk.Label(frm, text="Step 3: Uniform first-order").grid(row=6, column=0, sticky="w")
     btn_step3_uniform_first = tk.Button(
         frm,
         text="Solve uniform first-order",
@@ -905,36 +905,42 @@ def main():
             lambda: step3_uniform_first_order(lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step3_uniform_first.grid(row=5, column=13, padx=4, sticky="w")
+    btn_step3_uniform_first.grid(row=6, column=2, padx=4, sticky="w")
     btn_overview_uniform_first = tk.Button(
         frm,
         text="Overview (uniform first-order)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_overview_uniform_first,
             lambda: step4_render_overview("uniform_first_order", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_uniform_first.grid(row=5, column=14, padx=4, sticky="w")
+    btn_overview_uniform_first.grid(row=6, column=3, padx=4, sticky="w")
     btn_grad0_uniform_first = tk.Button(
         frm,
         text="Gradients @ surface (uniform first-order)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad0_uniform_first,
             lambda: step4_render_gradient("uniform_first_order", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_uniform_first.grid(row=5, column=15, padx=4, sticky="w")
+    btn_grad0_uniform_first.grid(row=6, column=4, padx=4, sticky="w")
     btn_grad100_uniform_first = tk.Button(
         frm,
         text="Gradients @ 100 km (uniform first-order)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad100_uniform_first,
             lambda: step4_render_gradient("uniform_first_order", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_uniform_first.grid(row=5, column=16, padx=4, sticky="w")
+    btn_grad100_uniform_first.grid(row=6, column=5, padx=4, sticky="w")
 
-    ttk.Label(frm, text="Step 3b: Uniform self-consistent").grid(row=6, column=0, sticky="w")
+    ttk.Label(frm, text="Step 3b: Uniform self-consistent").grid(row=7, column=0, sticky="w")
     btn_step3_uniform_self = tk.Button(
         frm,
         text="Solve uniform self-consistent",
@@ -943,37 +949,43 @@ def main():
             lambda: step3_uniform_self_consistent(lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step3_uniform_self.grid(row=6, column=13, padx=4, sticky="w")
+    btn_step3_uniform_self.grid(row=7, column=2, padx=4, sticky="w")
     btn_overview_uniform_self = tk.Button(
         frm,
         text="Overview (uniform self-consistent)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_overview_uniform_self,
             lambda: step4_render_overview("uniform_self_consistent", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_uniform_self.grid(row=6, column=14, padx=4, sticky="w")
+    btn_overview_uniform_self.grid(row=7, column=3, padx=4, sticky="w")
     btn_grad0_uniform_self = tk.Button(
         frm,
         text="Gradients @ surface (uniform self-consistent)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad0_uniform_self,
             lambda: step4_render_gradient("uniform_self_consistent", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_uniform_self.grid(row=6, column=15, padx=4, sticky="w")
+    btn_grad0_uniform_self.grid(row=7, column=4, padx=4, sticky="w")
     btn_grad100_uniform_self = tk.Button(
         frm,
         text="Gradients @ 100 km (uniform self-consistent)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad100_uniform_self,
             lambda: step4_render_gradient("uniform_self_consistent", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_uniform_self.grid(row=6, column=16, padx=4, sticky="w")
+    btn_grad100_uniform_self.grid(row=7, column=5, padx=4, sticky="w")
 
     # Step 4: Spectral first-order + plots
-    ttk.Label(frm, text="Step 4: Spectral first-order").grid(row=7, column=0, sticky="w")
+    ttk.Label(frm, text="Step 4: Spectral first-order").grid(row=8, column=0, sticky="w")
     btn_step4_spectral_first = tk.Button(
         frm,
         text="Solve spectral first-order",
@@ -982,37 +994,43 @@ def main():
             lambda: step4_spectral_first_order(lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step4_spectral_first.grid(row=7, column=13, padx=4, sticky="w")
+    btn_step4_spectral_first.grid(row=8, column=2, padx=4, sticky="w")
     btn_overview_spectral_first = tk.Button(
         frm,
         text="Overview (spectral first-order)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_overview_spectral_first,
             lambda: step4_render_overview("spectral_first_order", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_spectral_first.grid(row=7, column=14, padx=4, sticky="w")
+    btn_overview_spectral_first.grid(row=8, column=3, padx=4, sticky="w")
     btn_grad0_spectral_first = tk.Button(
         frm,
         text="Gradients @ surface (spectral first-order)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad0_spectral_first,
             lambda: step4_render_gradient("spectral_first_order", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_spectral_first.grid(row=7, column=15, padx=4, sticky="w")
+    btn_grad0_spectral_first.grid(row=8, column=4, padx=4, sticky="w")
     btn_grad100_spectral_first = tk.Button(
         frm,
         text="Gradients @ 100 km (spectral first-order)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad100_spectral_first,
             lambda: step4_render_gradient("spectral_first_order", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_spectral_first.grid(row=7, column=16, padx=4, sticky="w")
+    btn_grad100_spectral_first.grid(row=8, column=5, padx=4, sticky="w")
 
     # Step 5: Spectral self-consistent + plots
-    ttk.Label(frm, text="Step 5: Spectral self-consistent").grid(row=8, column=0, sticky="w")
+    ttk.Label(frm, text="Step 5: Spectral self-consistent").grid(row=9, column=0, sticky="w")
     btn_step5_spectral_self = tk.Button(
         frm,
         text="Solve spectral self-consistent",
@@ -1021,37 +1039,43 @@ def main():
             lambda: step5_spectral_self_consistent(lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step5_spectral_self.grid(row=8, column=13, padx=4, sticky="w")
+    btn_step5_spectral_self.grid(row=9, column=2, padx=4, sticky="w")
     btn_overview_spectral_self = tk.Button(
         frm,
         text="Overview (spectral self-consistent)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_overview_spectral_self,
             lambda: step4_render_overview("spectral_self_consistent", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_spectral_self.grid(row=8, column=14, padx=4, sticky="w")
+    btn_overview_spectral_self.grid(row=9, column=3, padx=4, sticky="w")
     btn_grad0_spectral_self = tk.Button(
         frm,
         text="Gradients @ surface (spectral self-consistent)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad0_spectral_self,
             lambda: step4_render_gradient("spectral_self_consistent", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_spectral_self.grid(row=8, column=15, padx=4, sticky="w")
+    btn_grad0_spectral_self.grid(row=9, column=4, padx=4, sticky="w")
     btn_grad100_spectral_self = tk.Button(
         frm,
         text="Gradients @ 100 km (spectral self-consistent)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad100_spectral_self,
             lambda: step4_render_gradient("spectral_self_consistent", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_spectral_self.grid(row=8, column=16, padx=4, sticky="w")
+    btn_grad100_spectral_self.grid(row=9, column=5, padx=4, sticky="w")
 
     # Step 6: Spectral iterative + plots
-    ttk.Label(frm, text="Step 6: Spectral iterative").grid(row=9, column=0, sticky="w")
+    ttk.Label(frm, text="Step 6: Spectral iterative").grid(row=10, column=0, sticky="w")
     btn_step6_spectral_iter = tk.Button(
         frm,
         text="Solve spectral iterative",
@@ -1060,37 +1084,43 @@ def main():
             lambda: step6_spectral_iterative(int(iter_order_var.get()), lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step6_spectral_iter.grid(row=9, column=13, padx=4, sticky="w")
+    btn_step6_spectral_iter.grid(row=10, column=2, padx=4, sticky="w")
     btn_overview_spectral_iter = tk.Button(
         frm,
         text="Overview (spectral iterative)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_overview_spectral_iter,
             lambda: step4_render_overview("spectral_iterative", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_spectral_iter.grid(row=9, column=14, padx=4, sticky="w")
+    btn_overview_spectral_iter.grid(row=10, column=3, padx=4, sticky="w")
     btn_grad0_spectral_iter = tk.Button(
         frm,
         text="Gradients @ surface (spectral iterative)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad0_spectral_iter,
             lambda: step4_render_gradient("spectral_iterative", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_spectral_iter.grid(row=9, column=15, padx=4, sticky="w")
+    btn_grad0_spectral_iter.grid(row=10, column=4, padx=4, sticky="w")
     btn_grad100_spectral_iter = tk.Button(
         frm,
         text="Gradients @ 100 km (spectral iterative)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad100_spectral_iter,
             lambda: step4_render_gradient("spectral_iterative", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_spectral_iter.grid(row=9, column=16, padx=4, sticky="w")
+    btn_grad100_spectral_iter.grid(row=10, column=5, padx=4, sticky="w")
 
     # Step 7: Compare solves
-    ttk.Label(frm, text="Step 7: Compare to uniform first-order").grid(row=10, column=0, sticky="w")
+    ttk.Label(frm, text="Step 7: Compare to uniform first-order").grid(row=11, column=0, sticky="w")
     btn_step7_compare = tk.Button(
         frm,
         text="Compare solutions",
@@ -1099,10 +1129,10 @@ def main():
             lambda: step7_compare_to_uniform_first_order(lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step7_compare.grid(row=10, column=13, padx=4, sticky="w")
+    btn_step7_compare.grid(row=11, column=2, padx=4, sticky="w")
 
-    frm.rowconfigure(11, weight=1)
-    frm.columnconfigure(17, weight=1)
+    frm.rowconfigure(12, weight=1)
+    frm.columnconfigure(6, weight=1)
 
     subdiv_var.trace_add("write", lambda *_: _update_lmax_button_color())
     lmax_var.trace_add("write", lambda *_: _update_lmax_button_color())

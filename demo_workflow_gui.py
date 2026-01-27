@@ -150,14 +150,29 @@ def _complex_sheet_admittance(
     return Y.to(torch.complex128)
 
 
-def step1_build_grid_admittance(subdiv: int, lmax: int, checker_divisions: int, log) -> Path:
+def step1_build_grid_admittance(
+    subdiv: int,
+    lmax: int,
+    checker_divisions: int,
+    checker_mean: float,
+    checker_contrast_pct: float,
+    log,
+) -> Path:
     subdiv = max(0, int(subdiv))
     actual_faces = _faces_for_subdiv(subdiv)
     nside = _nside_from_subdivisions(subdiv)
     grid_cfg = GridConfig(nside=nside, lmax=lmax, radius_m=1.56e6, device="cpu")
     grid = make_grid(grid_cfg)
-    sigma_2d_max = 2.0 * grid_cfg.seawater_conductivity_s_per_m * grid_cfg.ocean_thickness_m
-    cond_real = _checkerboard_admittance(grid.positions.to(torch.float64), 0.0, sigma_2d_max, checker_divisions)
+    contrast = max(0.0, min(100.0, float(checker_contrast_pct))) / 100.0
+    mean_val = max(0.0, float(checker_mean))
+    sigma_low = mean_val * (1.0 - contrast)
+    sigma_high = mean_val * (1.0 + contrast)
+    cond_real = _checkerboard_admittance(
+        grid.positions.to(torch.float64),
+        sigma_low,
+        sigma_high,
+        checker_divisions,
+    )
     omega = 2.0 * math.pi / (9.925 * 3600.0)
     cond = _complex_sheet_admittance(cond_real, omega, grid_cfg.radius_m)
     Y_s = sh_forward(cond, grid.positions.to(torch.float64), lmax=grid_cfg.lmax, weights=grid.areas.to(torch.float64))
@@ -169,7 +184,10 @@ def step1_build_grid_admittance(subdiv: int, lmax: int, checker_divisions: int, 
         "neighbors": grid.neighbors,
         "admittance_spectral": Y_s,
         "admittance_grid": cond,
-        "sigma_2d_max": sigma_2d_max,
+        "checker_mean": mean_val,
+        "checker_contrast_pct": float(checker_contrast_pct),
+        "checker_low": sigma_low,
+        "checker_high": sigma_high,
         "checker_divisions": checker_divisions,
         "subdivisions": subdiv,
     }
@@ -687,8 +705,8 @@ def main():
     root.rowconfigure(0, weight=1)
 
     # Log output (placed early so lambdas can close over it)
-    log_widget = tk.Text(frm, height=18, width=120)
-    log_widget.grid(row=9, column=0, columnspan=10, pady=8, sticky="nsew")
+    log_widget = tk.Text(frm, height=18, width=45)
+    log_widget.grid(row=11, column=0, columnspan=10, pady=8, sticky="nsew")
 
     def run_step(button: tk.Button, task, on_success=None):
         """Run a task in a thread, coloring the button yellow while running, green on success, red on error."""
@@ -792,12 +810,20 @@ def main():
     ttk.Label(frm, text="lmax").grid(row=1, column=7, sticky="e")
     lmax_var = tk.StringVar(value="35")
     ttk.Entry(frm, textvariable=lmax_var, width=6).grid(row=1, column=8, sticky="w")
-    ttk.Label(frm, text="checker subdivisions (1->1, 2->2, 3->4)").grid(row=1, column=9, sticky="e")
+    ttk.Label(frm, text="checker subdivs").grid(row=2, column=1, sticky="e")
     div_var = tk.StringVar(value="2")
-    ttk.Entry(frm, textvariable=div_var, width=6).grid(row=1, column=10, sticky="w")
+    ttk.Entry(frm, textvariable=div_var, width=6).grid(row=2, column=2, sticky="w")
     sh_count_var = tk.StringVar(value="1296")
-    ttk.Label(frm, text="# SH coeffs=").grid(row=1, column=11, sticky="e")
-    ttk.Label(frm, textvariable=sh_count_var).grid(row=1, column=12, sticky="w")
+    ttk.Label(frm, text="# SH coeffs=").grid(row=2, column=3, sticky="e")
+    ttk.Label(frm, textvariable=sh_count_var).grid(row=2, column=4, sticky="w")
+    default_cfg = GridConfig(nside=1, lmax=1, radius_m=1.56e6, device="cpu")
+    default_mean = default_cfg.seawater_conductivity_s_per_m * default_cfg.ocean_thickness_m
+    ttk.Label(frm, text="checker mean").grid(row=3, column=1, sticky="e")
+    checker_mean_var = tk.StringVar(value=f"{default_mean:.3e}")
+    ttk.Entry(frm, textvariable=checker_mean_var, width=10).grid(row=3, column=2, sticky="w")
+    ttk.Label(frm, text="contrast (%)").grid(row=3, column=3, sticky="e")
+    checker_contrast_var = tk.StringVar(value="5")
+    ttk.Entry(frm, textvariable=checker_contrast_var, width=6).grid(row=3, column=4, sticky="w")
     btn_l_from_faces = tk.Button(
         frm,
         text="Set lmax from faces",
@@ -817,7 +843,7 @@ def main():
             _update_lmax_button_color(),
         ],
     )
-    btn_l_from_faces.grid(row=1, column=13, padx=4)
+    btn_l_from_faces.grid(row=2, column=5, padx=4, sticky="w")
     btn_step1 = tk.Button(
         frm,
         text="Run Step 1",
@@ -827,6 +853,8 @@ def main():
                 int(subdiv_var.get()),
                 int(lmax_var.get()),
                 int(div_var.get()),
+                float(checker_mean_var.get()),
+                float(checker_contrast_var.get()),
                 lambda msg: _log(log_widget, msg),
             ),
             on_success=lambda res: (
@@ -839,40 +867,40 @@ def main():
             ),
         ),
     )
-    btn_step1.grid(row=1, column=14, padx=6)
-    ttk.Label(frm, text="iter order").grid(row=1, column=15, sticky="e")
+    btn_step1.grid(row=1, column=3, padx=6, sticky="w")
+    ttk.Label(frm, text="iter order").grid(row=1, column=4, sticky="e")
     iter_order_var = tk.StringVar(value="3")
-    ttk.Entry(frm, textvariable=iter_order_var, width=6).grid(row=1, column=16, sticky="w")
+    ttk.Entry(frm, textvariable=iter_order_var, width=6).grid(row=1, column=5, sticky="w")
 
     # Step 1b
-    ttk.Label(frm, text="Step 1b: Roundtrip check").grid(row=2, column=0, sticky="w")
+    ttk.Label(frm, text="Step 1b: Roundtrip check").grid(row=4, column=0, sticky="w")
     btn_step1b = tk.Button(
         frm,
         text="Plot admittance roundtrip",
         command=lambda: run_step_ui(btn_step1b, lambda: step1b_plot_roundtrip(lambda msg: _log(log_widget, msg))),
     )
-    btn_step1b.grid(row=2, column=13, padx=6)
+    btn_step1b.grid(row=4, column=2, padx=6, sticky="w")
 
     # Step 1c
-    ttk.Label(frm, text="Step 1c: Roundtrip stability").grid(row=3, column=0, sticky="w")
+    ttk.Label(frm, text="Step 1c: Roundtrip stability").grid(row=5, column=0, sticky="w")
     btn_step1c = tk.Button(
         frm,
         text="Plot roundtrip 1 vs 2",
         command=lambda: run_step_ui(btn_step1c, lambda: step1c_plot_roundtrip_stability(lambda msg: _log(log_widget, msg))),
     )
-    btn_step1c.grid(row=3, column=13, padx=6)
+    btn_step1c.grid(row=5, column=2, padx=6, sticky="w")
 
     # Step 2
-    ttk.Label(frm, text="Step 2: Ambient field").grid(row=4, column=0, sticky="w")
+    ttk.Label(frm, text="Step 2: Ambient field").grid(row=6, column=0, sticky="w")
     btn_step2 = tk.Button(
         frm,
         text="Build ambient",
         command=lambda: run_step(btn_step2, lambda: step2_build_ambient(lambda msg: _log(log_widget, msg))),
     )
-    btn_step2.grid(row=4, column=13, padx=6)
+    btn_step2.grid(row=6, column=2, padx=6, sticky="w")
 
     # Step 4: First-order solve + plots
-    ttk.Label(frm, text="Step 4: First-order solve").grid(row=5, column=0, sticky="w")
+    ttk.Label(frm, text="Step 4: First-order solve").grid(row=7, column=0, sticky="w")
     btn_step4_first = tk.Button(
         frm,
         text="Solve first-order",
@@ -881,37 +909,43 @@ def main():
             lambda: step3_solve_currents(True, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step4_first.grid(row=5, column=13, padx=4, sticky="w")
+    btn_step4_first.grid(row=7, column=2, padx=4, sticky="w")
     btn_overview_first = tk.Button(
         frm,
         text="Overview (first-order)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_overview_first,
             lambda: step4_render_overview("first_order", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_first.grid(row=5, column=14, padx=4, sticky="w")
+    btn_overview_first.grid(row=7, column=3, padx=4, sticky="w")
     btn_grad0_first = tk.Button(
         frm,
         text="Gradients @ surface (first-order)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad0_first,
             lambda: step4_render_gradient("first_order", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_first.grid(row=5, column=15, padx=4, sticky="w")
+    btn_grad0_first.grid(row=7, column=4, padx=4, sticky="w")
     btn_grad100_first = tk.Button(
         frm,
         text="Gradients @ 100 km (first-order)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad100_first,
             lambda: step4_render_gradient("first_order", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_first.grid(row=5, column=16, padx=4, sticky="w")
+    btn_grad100_first.grid(row=7, column=5, padx=4, sticky="w")
 
     # Step 5: Self-consistent solve + plots
-    ttk.Label(frm, text="Step 5: Self-consistent solve").grid(row=6, column=0, sticky="w")
+    ttk.Label(frm, text="Step 5: Self-consistent solve").grid(row=8, column=0, sticky="w")
     btn_step5_self = tk.Button(
         frm,
         text="Solve self-consistent",
@@ -920,37 +954,43 @@ def main():
             lambda: step3_solve_currents(False, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step5_self.grid(row=6, column=13, padx=4, sticky="w")
+    btn_step5_self.grid(row=8, column=2, padx=4, sticky="w")
     btn_overview_self = tk.Button(
         frm,
         text="Overview (self-consistent)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_overview_self,
             lambda: step4_render_overview("self_consistent", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_self.grid(row=6, column=14, padx=4, sticky="w")
+    btn_overview_self.grid(row=8, column=3, padx=4, sticky="w")
     btn_grad0_self = tk.Button(
         frm,
         text="Gradients @ surface (self-consistent)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad0_self,
             lambda: step4_render_gradient("self_consistent", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_self.grid(row=6, column=15, padx=4, sticky="w")
+    btn_grad0_self.grid(row=8, column=4, padx=4, sticky="w")
     btn_grad100_self = tk.Button(
         frm,
         text="Gradients @ 100 km (self-consistent)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad100_self,
             lambda: step4_render_gradient("self_consistent", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_self.grid(row=6, column=16, padx=4, sticky="w")
+    btn_grad100_self.grid(row=8, column=5, padx=4, sticky="w")
 
     # Step 6: Iterative series solve + plots
-    ttk.Label(frm, text="Step 6: Iterative solve").grid(row=7, column=0, sticky="w")
+    ttk.Label(frm, text="Step 6: Iterative solve").grid(row=9, column=0, sticky="w")
     btn_step6_iter = tk.Button(
         frm,
         text="Solve iterative",
@@ -959,37 +999,43 @@ def main():
             lambda: step6_iterative_solve(int(iter_order_var.get()), lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step6_iter.grid(row=7, column=13, padx=4, sticky="w")
+    btn_step6_iter.grid(row=9, column=2, padx=4, sticky="w")
     btn_overview_iter = tk.Button(
         frm,
         text="Overview (iterative)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_overview_iter,
             lambda: step4_render_overview("iterative", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_iter.grid(row=7, column=14, padx=4, sticky="w")
+    btn_overview_iter.grid(row=9, column=3, padx=4, sticky="w")
     btn_grad0_iter = tk.Button(
         frm,
         text="Gradients @ surface (iterative)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad0_iter,
             lambda: step4_render_gradient("iterative", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_iter.grid(row=7, column=15, padx=4, sticky="w")
+    btn_grad0_iter.grid(row=9, column=4, padx=4, sticky="w")
     btn_grad100_iter = tk.Button(
         frm,
         text="Gradients @ 100 km (iterative)",
+        wraplength=180,
+        justify="left",
         command=lambda: run_step_ui(
             btn_grad100_iter,
             lambda: step4_render_gradient("iterative", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_iter.grid(row=7, column=16, padx=4, sticky="w")
+    btn_grad100_iter.grid(row=9, column=5, padx=4, sticky="w")
 
-    frm.rowconfigure(9, weight=1)
-    frm.columnconfigure(17, weight=1)
+    frm.rowconfigure(11, weight=1)
+    frm.columnconfigure(6, weight=1)
 
     subdiv_var.trace_add("write", lambda *_: _update_lmax_button_color())
     lmax_var.trace_add("write", lambda *_: _update_lmax_button_color())
