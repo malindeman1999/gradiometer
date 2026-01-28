@@ -97,7 +97,7 @@ def _lmax_for_target_faces(faces: int) -> int:
         if err < best_err:
             best_err = err
             best = alt
-    return best
+    return best + 1
 
 
 def _mean_face_center_spacing_km(subdivisions: int, radius_m: float) -> float:
@@ -905,7 +905,7 @@ def main():
     )
     ttk.Label(frm, textvariable=spacing_var).grid(row=1, column=6, sticky="w")
     ttk.Label(frm, text="lmax").grid(row=1, column=7, sticky="e")
-    lmax_var = tk.StringVar(value="35")
+    lmax_var = tk.StringVar(value="36")
     ttk.Entry(frm, textvariable=lmax_var, width=6).grid(row=1, column=8, sticky="w")
     sh_count_var = tk.StringVar(value="1296")
     ttk.Label(frm, text="# SH coeffs=").grid(row=2, column=1, sticky="e")
