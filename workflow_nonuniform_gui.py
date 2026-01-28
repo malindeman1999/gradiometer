@@ -1,6 +1,6 @@
 """
 GUI for running the non-uniform demo pipeline in four stages:
-1) Build grid + admittance (checkerboard pattern)
+1) Build grid + admittance (single-mode conductivity)
 2) Build ambient field
 3) Solve currents (self-consistent by default, or first-order)
 4) Render overview and gradient plots
@@ -49,21 +49,65 @@ def _log(text_widget: tk.Text, msg: str) -> None:
     text_widget.update_idletasks()
 
 
-def _checkerboard_admittance(positions: torch.Tensor, sigma_low: float, sigma_high: float, divisions: int) -> torch.Tensor:
-    """Assign a checkerboard pattern over (theta, phi) using subdivision-style divisions."""
-    x, y, z = positions[:, 0], positions[:, 1], positions[:, 2]
-    r = torch.linalg.norm(positions, dim=1)
-    theta = torch.acos(torch.clamp(z / r, -1.0, 1.0))  # [0, pi]
-    phi = torch.atan2(y, x)
-    phi = torch.remainder(phi, 2 * math.pi)  # [0, 2pi)
+def _synthesize_sigma_field(
+    positions: torch.Tensor,
+    weights: torch.Tensor,
+    lmax: int,
+    mean: float,
+    frac_rms: float,
+    mode_l: int,
+    mode_m: int,
+    log=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a real conductivity field with target RMS and single (l,±m) modes."""
+    mode_l = int(max(0, min(mode_l, lmax)))
+    mode_m = int(max(0, min(abs(mode_m), mode_l)))
+    frac_rms = max(0.0, float(frac_rms))
+    delta_coeffs = torch.zeros((lmax + 1, 2 * lmax + 1), dtype=torch.complex128)
+    rng = np.random.default_rng()
+    phase = rng.uniform(0.0, 2 * math.pi)
+    c = math.cos(phase) + 1j * math.sin(phase)
+    delta_coeffs[mode_l, lmax + mode_m] = c
+    delta_coeffs[mode_l, lmax - mode_m] = ((-1) ** mode_m) * np.conj(c)
+    delta = sh_inverse(delta_coeffs, positions, weights)
+    imag_max = float(delta.imag.abs().max().item())
+    real_max = float(delta.real.abs().max().item())
+    tol = max(1e-12, 1e-9 * max(real_max, 1e-30))
+    if imag_max > tol:
+        raise RuntimeError(
+            f"Conductivity synthesis produced significant imaginary values: "
+            f"max|imag|={imag_max:.3e} (tol={tol:.3e})."
+        )
+    delta = delta.real
+    delta = delta - delta.mean()
+    current_rms = float(torch.sqrt((delta ** 2).mean()).item())
+    target_rms = mean * frac_rms
+    if current_rms > 0.0 and target_rms > 0.0:
+        scale = target_rms / current_rms
+        delta_coeffs = delta_coeffs * scale
+    else:
+        delta_coeffs = torch.zeros_like(delta_coeffs)
 
-    div_level = max(1, int(divisions))
-    # Map subdivision level -> bins per axis: 1->1, 2->2, 3->4, 4->8, ...
-    div = 1 if div_level <= 1 else 2 ** (div_level - 1)
-    theta_bin = torch.floor(theta / (math.pi / div))
-    phi_bin = torch.floor(phi / (2 * math.pi / div))
-    parity = (theta_bin + phi_bin).to(torch.int64) % 2
-    return torch.where(parity == 0, torch.full_like(theta, sigma_low), torch.full_like(theta, sigma_high))
+    sigma_coeffs = delta_coeffs.clone()
+    c00 = mean / (2.0 * math.sqrt(math.pi))
+    sigma_coeffs[0, lmax] = c00
+    sigma = sh_inverse(sigma_coeffs, positions, weights)
+    imag_max = float(sigma.imag.abs().max().item())
+    real_max = float(sigma.real.abs().max().item())
+    tol = max(1e-12, 1e-9 * max(real_max, 1e-30))
+    if imag_max > tol:
+        raise RuntimeError(
+            f"Conductivity synthesis produced significant imaginary values: "
+            f"max|imag|={imag_max:.3e} (tol={tol:.3e})."
+        )
+    sigma = sigma.real
+    if float(sigma.min().item()) <= 0.0:
+        if log is not None:
+            log(
+                "Warning: conductivity synthesis produced non-positive values on the grid. "
+                "Plots may show unphysical regions."
+            )
+    return sigma, sigma_coeffs
 
 
 def _subdivisions_from_faces(target_faces: int) -> int:
@@ -140,10 +184,11 @@ def _complex_sheet_admittance(
     sigma_s: torch.Tensor,
     omega: float,
     radius_m: float,
+    inductance_scale: float = 1.0,
 ) -> torch.Tensor:
     """Compute complex sheet admittance from thin-shell impedance model."""
     sigma_s = sigma_s.to(torch.float64)
-    X_s = omega * float(inductance.MU0) * radius_m / 2.0
+    X_s = float(inductance_scale) * omega * float(inductance.MU0) * radius_m / 2.0
     R_s = torch.where(sigma_s > 0, 1.0 / sigma_s, torch.zeros_like(sigma_s))
     Z = R_s + 1j * X_s
     Y = torch.where(sigma_s > 0, 1.0 / Z, torch.zeros_like(Z))
@@ -153,9 +198,11 @@ def _complex_sheet_admittance(
 def step1_build_grid_admittance(
     subdiv: int,
     lmax: int,
-    checker_divisions: int,
-    checker_mean: float,
-    checker_contrast_pct: float,
+    mean_cond: float,
+    frac_rms: float,
+    mode_l: int,
+    mode_m: int,
+    inductance_scale: float,
     log,
 ) -> Path:
     subdiv = max(0, int(subdiv))
@@ -163,19 +210,37 @@ def step1_build_grid_admittance(
     nside = _nside_from_subdivisions(subdiv)
     grid_cfg = GridConfig(nside=nside, lmax=lmax, radius_m=1.56e6, device="cpu")
     grid = make_grid(grid_cfg)
-    contrast = max(0.0, min(100.0, float(checker_contrast_pct))) / 100.0
-    mean_val = max(0.0, float(checker_mean))
-    sigma_low = mean_val * (1.0 - contrast)
-    sigma_high = mean_val * (1.0 + contrast)
-    cond_real = _checkerboard_admittance(
+    mean_val = max(0.0, float(mean_cond))
+    frac_rms = max(0.0, float(frac_rms))
+    mode_l = int(mode_l)
+    mode_m = int(mode_m)
+    cond_real, sigma_coeffs = _synthesize_sigma_field(
         grid.positions.to(torch.float64),
-        sigma_low,
-        sigma_high,
-        checker_divisions,
+        grid.areas.to(torch.float64),
+        grid_cfg.lmax,
+        mean_val,
+        frac_rms,
+        mode_l,
+        mode_m,
+        log,
+    )
+    realized_rms = float(torch.sqrt(((cond_real - mean_val) ** 2).mean()).item())
+    min_val = float(cond_real.min().item())
+    max_val = float(cond_real.max().item())
+    log(
+        f"Sigma_s stats: mean={mean_val:.3e}, rms={realized_rms:.3e} "
+        f"(frac={realized_rms/mean_val if mean_val > 0 else 0.0:.2%}), "
+        f"min={min_val:.3e}, max={max_val:.3e}"
     )
     omega = 2.0 * math.pi / (9.925 * 3600.0)
-    cond = _complex_sheet_admittance(cond_real, omega, grid_cfg.radius_m)
+    cond = _complex_sheet_admittance(cond_real, omega, grid_cfg.radius_m, inductance_scale=inductance_scale)
     Y_s = sh_forward(cond, grid.positions.to(torch.float64), lmax=grid_cfg.lmax, weights=grid.areas.to(torch.float64))
+    sigma_proj = sh_forward(
+        cond_real.to(torch.float64),
+        grid.positions.to(torch.float64),
+        lmax=grid_cfg.lmax,
+        weights=grid.areas.to(torch.float64),
+    )
     state = {
         "grid_cfg": grid_cfg,
         "positions": grid.positions,
@@ -184,11 +249,14 @@ def step1_build_grid_admittance(
         "neighbors": grid.neighbors,
         "admittance_spectral": Y_s,
         "admittance_grid": cond,
-        "checker_mean": mean_val,
-        "checker_contrast_pct": float(checker_contrast_pct),
-        "checker_low": sigma_low,
-        "checker_high": sigma_high,
-        "checker_divisions": checker_divisions,
+        "sigma_spectral": sigma_proj,
+        "sigma_spectral_target": sigma_coeffs,
+        "sigma_grid": cond_real,
+        "sigma_mean": mean_val,
+        "sigma_frac_rms": frac_rms,
+        "sigma_mode_l": int(mode_l),
+        "sigma_mode_m": int(mode_m),
+        "inductance_scale": float(inductance_scale),
         "subdivisions": subdiv,
     }
     path = _save_state("grid_admittance.pt", state)
@@ -201,59 +269,53 @@ def step1b_plot_roundtrip(log) -> None:
     positions = state["positions"].to(torch.float64)
     weights = state["areas"].to(torch.float64)
     coeffs = state["admittance_spectral"]
-    orig = state.get("admittance_grid")
-    if orig is None:
-        raise RuntimeError("Missing admittance grid. Run Step 1 before Step 1b.")
-
     recon = sh_inverse(coeffs, positions, weights)
-
-    orig = orig.to(torch.complex128).reshape(-1).cpu().numpy()
     recon = recon.reshape(-1).cpu().numpy()
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    idx = np.arange(orig.size)
-    real_a = orig.real
-    real_b = recon.real
-    imag_a = orig.imag
-    imag_b = recon.imag
-
-    for ax, a, b, label in (
-        (axes[0], real_a, real_b, "Real"),
-        (axes[1], imag_a, imag_b, "Imag"),
+    idx = np.arange(recon.size)
+    for ax, a, label in (
+        (axes[0], recon.real, "Real"),
+        (axes[1], recon.imag, "Imag"),
     ):
-        ax.scatter(idx, a, s=8, alpha=0.7, label="Roundtrip 0")
-        ax.scatter(idx, b, s=8, alpha=0.7, label="Roundtrip 1")
-        ax.vlines(idx, a, b, colors="gray", alpha=0.3, linewidth=0.5)
-        ax.set_title(f"{label} part: roundtrip 0 vs 1")
+        ax.scatter(idx, a, s=8, alpha=0.7, label="Spectral reconstruction")
+        ax.set_title(f"{label} part: spectral reconstruction")
         ax.set_xlabel("Grid point index")
         ax.set_ylabel("Admittance (S)")
         ax.legend(loc="best", frameon=False)
 
     fig.tight_layout()
     plt.show()
-    _plot_roundtrip_sphere_maps(
-        orig,
-        "Roundtrip 0",
-        recon,
-        "Roundtrip 1",
-        positions=positions,
-        subdivisions=int(state["subdivisions"]),
-        radius=float(state["grid_cfg"].radius_m),
-    )
-    log("Step 1b complete. Displayed round-trip scatter plots.")
+    sigma_grid = state.get("sigma_grid")
+    if sigma_grid is not None:
+        sigma_vals = sigma_grid.to(torch.float64).reshape(-1).cpu().numpy()
+        _plot_admittance_and_conductivity_spheres(
+            sigma_vals,
+            recon,
+            positions=positions,
+            subdivisions=int(state["subdivisions"]),
+            radius=float(state["grid_cfg"].radius_m),
+        )
+    log("Step 1b complete. Displayed spectral reconstruction plots.")
 
 
 def step1b_plot_admittance_power(log) -> None:
     state = _load_state("grid_admittance.pt")
     coeffs = state.get("admittance_spectral")
-    if coeffs is None:
-        raise RuntimeError("Missing admittance_spectral. Run Step 1 before plotting admittance power.")
+    sigma_coeffs = state.get("sigma_spectral")
+    if coeffs is None or sigma_coeffs is None:
+        raise RuntimeError("Missing admittance_spectral or sigma_spectral. Run Step 1 before plotting magnitudes.")
+    mode_l = state.get("sigma_mode_l", None)
+    mode_m = state.get("sigma_mode_m", None)
+    frac_rms = state.get("sigma_frac_rms", None)
+    mode_l_str = f"{int(mode_l)}" if mode_l is not None else "?"
+    mode_m_str = f"{int(mode_m)}" if mode_m is not None else "?"
+    frac_rms_str = f"{float(frac_rms):.2%}" if frac_rms is not None else "?"
+    title_suffix = f"(l={mode_l_str}, m=±{mode_m_str}, frac RMS {frac_rms_str})"
 
     l_b, m_b, mag = _flatten_harmonics(coeffs.to(torch.complex128))
-    magnitude = mag
-    peak = float(max(np.max(magnitude), 1e-30))
-    eps = peak * 1e-9
-    active = magnitude > eps
+    _, _, mag_sigma = _flatten_harmonics(sigma_coeffs.to(torch.complex128))
+    active = (mag > 0.0) | (mag_sigma > 0.0)
     active_ls = l_b[active]
     l_cut = int(active_ls.max()) if active_ls.size else 1
     l_cut = max(l_cut, 1)
@@ -262,75 +324,57 @@ def step1b_plot_admittance_power(log) -> None:
     tick_idx = np.where(m_b[keep] == 0)[0]
     tick_labels = [f"({l},0)" for l in l_b[keep][tick_idx]]
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.5))
-    ax.bar(x, np.maximum(magnitude[keep], eps), color="#ff9c43")
-    ax.set_yscale("log")
-    ax.set_xlabel("(l,m) ordering; ticks at m=0")
-    ax.set_xticks(tick_idx)
-    ax.set_xticklabels(tick_labels, rotation=90)
-    ax.set_ylabel("|Y_s| (S)")
-    ax.set_title("Admittance mode magnitude")
-    ax.grid(True, which="both", alpha=0.3)
+    fig, axes = plt.subplots(2, 1, figsize=(7.5, 7.0), sharex=True)
+    sigma_vals = mag_sigma[keep]
+    sigma_vals_plot = np.where(sigma_vals > 0.0, sigma_vals, np.nan)
+    axes[0].bar(x, sigma_vals_plot, color="#5c9bd5")
+    axes[0].set_ylabel("|σ_s| (S)")
+    axes[0].set_title(f"Conductivity mode magnitude (S) {title_suffix}")
+    axes[0].grid(True, which="both", alpha=0.3)
+
+    y_vals = mag[keep]
+    y_vals_plot = np.where(y_vals > 0.0, y_vals, np.nan)
+    axes[1].bar(x, y_vals_plot, color="#ff9c43")
+    axes[1].set_xlabel("(l,m) ordering; ticks at m=0")
+    axes[1].set_xticks(tick_idx)
+    axes[1].set_xticklabels(tick_labels, rotation=90)
+    axes[1].set_ylabel("|Y_s| (S)")
+    axes[1].set_title(f"Admittance mode magnitude (S) {title_suffix}")
+    axes[1].grid(True, which="both", alpha=0.3)
     fig.tight_layout()
     plt.show()
-    log("Step 1b complete. Plotted admittance mode power.")
 
+    lmax = int(l_b.max()) if l_b.size else 0
+    l_vals = np.arange(lmax + 1)
+    rss_sigma = np.zeros(lmax + 1, dtype=np.float64)
+    rss_y = np.zeros(lmax + 1, dtype=np.float64)
+    for l in range(lmax + 1):
+        mask = l_b == l
+        rss_sigma[l] = float(np.sqrt(np.sum(mag_sigma[mask] ** 2)))
+        rss_y[l] = float(np.sqrt(np.sum(mag[mask] ** 2)))
 
-def step1c_plot_roundtrip_stability(log) -> None:
-    state = _load_state("grid_admittance.pt")
-    positions = state["positions"].to(torch.float64)
-    weights = state["areas"].to(torch.float64)
-    coeffs = state["admittance_spectral"]
-    orig = state.get("admittance_grid")
-    if orig is None:
-        raise RuntimeError("Missing admittance grid. Run Step 1 before Step 1c.")
+    fig2, axes2 = plt.subplots(2, 1, figsize=(7.5, 6.0), sharex=True)
+    rss_sigma_plot = np.where(rss_sigma > 0.0, rss_sigma, np.nan)
+    axes2[0].plot(l_vals, rss_sigma_plot, marker="o", linewidth=1.2, color="#5c9bd5")
+    axes2[0].set_ylabel("RSS |σ_s| (S)")
+    axes2[0].set_title(f"Conductivity by degree l (RSS, S) {title_suffix}")
+    axes2[0].grid(True, which="both", alpha=0.3)
 
-    lmax = coeffs.shape[-2] - 1
-    round1 = sh_inverse(coeffs, positions, weights)
-    coeffs2 = sh_forward(round1, positions, lmax=lmax, weights=weights)
-    round2 = sh_inverse(coeffs2, positions, weights)
+    rss_y_plot = np.where(rss_y > 0.0, rss_y, np.nan)
+    axes2[1].plot(l_vals, rss_y_plot, marker="o", linewidth=1.2, color="#ff9c43")
+    axes2[1].set_xlabel("Spherical harmonic degree l")
+    axes2[1].set_ylabel("RSS |Y_s| (S)")
+    axes2[1].set_title(f"Admittance by degree l (RSS, S) {title_suffix}")
+    axes2[1].grid(True, which="both", alpha=0.3)
 
-    round1 = round1.reshape(-1).cpu().numpy()
-    round2 = round2.reshape(-1).cpu().numpy()
-
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    idx = np.arange(round1.size)
-    real_a = round1.real
-    real_b = round2.real
-    imag_a = round1.imag
-    imag_b = round2.imag
-
-    for ax, a, b, label in (
-        (axes[0], real_a, real_b, "Real"),
-        (axes[1], imag_a, imag_b, "Imag"),
-    ):
-        ax.scatter(idx, a, s=8, alpha=0.7, label="Roundtrip 1")
-        ax.scatter(idx, b, s=8, alpha=0.7, label="Roundtrip 2")
-        ax.vlines(idx, a, b, colors="gray", alpha=0.3, linewidth=0.5)
-        ax.set_title(f"{label} part: roundtrip 1 vs 2")
-        ax.set_xlabel("Grid point index")
-        ax.set_ylabel("Admittance (S)")
-        ax.legend(loc="best", frameon=False)
-
-    fig.tight_layout()
+    fig2.tight_layout()
     plt.show()
-    _plot_roundtrip_sphere_maps(
-        round1,
-        "Roundtrip 1",
-        round2,
-        "Roundtrip 2",
-        positions=positions,
-        subdivisions=int(state["subdivisions"]),
-        radius=float(state["grid_cfg"].radius_m),
-    )
-    log("Step 1c complete. Displayed roundtrip stability scatter plots.")
+    log("Step 1b complete. Plotted conductivity/admittance magnitudes and per-l RSS.")
 
 
-def _plot_roundtrip_sphere_maps(
-    values_a: np.ndarray,
-    label_a: str,
-    values_b: np.ndarray,
-    label_b: str,
+def _plot_sphere_map_single(
+    values: np.ndarray,
+    label: str,
     positions: torch.Tensor,
     subdivisions: int,
     radius: float,
@@ -340,57 +384,133 @@ def _plot_roundtrip_sphere_maps(
     vertices, faces, centers = _build_mesh(radius, subdivisions=subdivisions, stride=1)
     face_count = faces.shape[0]
     node_count = int(positions.shape[0])
-    if values_a.size != node_count or values_b.size != node_count:
+    if values.size != node_count:
         raise RuntimeError(
-            "Roundtrip values do not match grid positions "
-            f"(nodes={node_count}, roundtrip0={values_a.size}, roundtrip1={values_b.size})."
+            "Sphere map values do not match grid positions "
+            f"(nodes={node_count}, values={values.size})."
         )
 
     tri_verts = vertices[faces].cpu().numpy()
-    vals_a = values_a.reshape(-1)
-    vals_b = values_b.reshape(-1)
+    vals = values.reshape(-1)
     pos = positions.detach().cpu().to(torch.float64)
     cen = centers.detach().cpu().to(torch.float64)
     nearest = torch.cdist(cen, pos).argmin(dim=1).cpu().numpy()
     if len(nearest) != face_count:
         raise RuntimeError("Failed to map grid values to mesh faces.")
-    vals_a = vals_a[nearest]
-    vals_b = vals_b[nearest]
+    vals = vals[nearest]
 
-    real_vmax = float(max(np.max(np.abs(vals_a.real)), np.max(np.abs(vals_b.real)), 1e-12))
-    imag_vmax = float(max(np.max(np.abs(vals_a.imag)), np.max(np.abs(vals_b.imag)), 1e-12))
+    real_vmax = float(max(np.max(np.abs(vals.real)), 1e-12))
+    imag_vmax = float(max(np.max(np.abs(vals.imag)), 1e-12))
     norm_real = mcolors.Normalize(vmin=-real_vmax, vmax=real_vmax)
     norm_imag = mcolors.Normalize(vmin=-imag_vmax, vmax=imag_vmax)
     cmap = plt.get_cmap("coolwarm")
 
     fig = plt.figure(figsize=(10, 8))
-    gs = fig.add_gridspec(2, 2, wspace=0.05, hspace=0.2)
+    gs = fig.add_gridspec(1, 2, wspace=0.05, hspace=0.2)
+    ax_real = fig.add_subplot(gs[0, 0], projection="3d")
+    _add_sphere_subplot(
+        ax_real,
+        vals.real,
+        norm_real,
+        cmap,
+        tri_verts,
+        radius,
+        f"{label} real(Y_s)",
+        elev=elev,
+        azim=azim,
+    )
+    ax_imag = fig.add_subplot(gs[0, 1], projection="3d")
+    _add_sphere_subplot(
+        ax_imag,
+        vals.imag,
+        norm_imag,
+        cmap,
+        tri_verts,
+        radius,
+        f"{label} imag(Y_s)",
+        elev=elev,
+        azim=azim,
+    )
 
-    for row, (label, vals) in enumerate(((label_a, vals_a), (label_b, vals_b))):
-        ax_real = fig.add_subplot(gs[row, 0], projection="3d")
-        _add_sphere_subplot(
-            ax_real,
-            vals.real,
-            norm_real,
-            cmap,
-            tri_verts,
-            radius,
-            f"{label} real(Y_s)",
-            elev=elev,
-            azim=azim,
+    plt.tight_layout()
+    plt.show()
+
+
+def _plot_admittance_and_conductivity_spheres(
+    sigma_real: np.ndarray,
+    admittance: np.ndarray,
+    positions: torch.Tensor,
+    subdivisions: int,
+    radius: float,
+    elev: float = 20.0,
+    azim: float = 30.0,
+) -> None:
+    vertices, faces, centers = _build_mesh(radius, subdivisions=subdivisions, stride=1)
+    face_count = faces.shape[0]
+    node_count = int(positions.shape[0])
+    if sigma_real.size != node_count or admittance.size != node_count:
+        raise RuntimeError(
+            "Sphere map values do not match grid positions "
+            f"(nodes={node_count}, sigma={sigma_real.size}, admittance={admittance.size})."
         )
-        ax_imag = fig.add_subplot(gs[row, 1], projection="3d")
-        _add_sphere_subplot(
-            ax_imag,
-            vals.imag,
-            norm_imag,
-            cmap,
-            tri_verts,
-            radius,
-            f"{label} imag(Y_s)",
-            elev=elev,
-            azim=azim,
-        )
+
+    tri_verts = vertices[faces].cpu().numpy()
+    pos = positions.detach().cpu().to(torch.float64)
+    cen = centers.detach().cpu().to(torch.float64)
+    nearest = torch.cdist(cen, pos).argmin(dim=1).cpu().numpy()
+    if len(nearest) != face_count:
+        raise RuntimeError("Failed to map grid values to mesh faces.")
+
+    sigma_vals = sigma_real.reshape(-1)[nearest]
+    adm_vals = admittance.reshape(-1)[nearest]
+
+    sigma_vmax = float(max(np.max(np.abs(sigma_vals)), 1e-12))
+    real_vmax = float(max(np.max(np.abs(adm_vals.real)), 1e-12))
+    imag_vmax = float(max(np.max(np.abs(adm_vals.imag)), 1e-12))
+    norm_sigma = mcolors.Normalize(vmin=-sigma_vmax, vmax=sigma_vmax)
+    norm_real = mcolors.Normalize(vmin=-real_vmax, vmax=real_vmax)
+    norm_imag = mcolors.Normalize(vmin=-imag_vmax, vmax=imag_vmax)
+    cmap = plt.get_cmap("coolwarm")
+
+    fig = plt.figure(figsize=(14, 5))
+    gs = fig.add_gridspec(1, 3, wspace=0.05)
+
+    ax_sigma = fig.add_subplot(gs[0, 0], projection="3d")
+    _add_sphere_subplot(
+        ax_sigma,
+        sigma_vals,
+        norm_sigma,
+        cmap,
+        tri_verts,
+        radius,
+        "Conductivity real(σ_s)",
+        elev=elev,
+        azim=azim,
+    )
+    ax_real = fig.add_subplot(gs[0, 1], projection="3d")
+    _add_sphere_subplot(
+        ax_real,
+        adm_vals.real,
+        norm_real,
+        cmap,
+        tri_verts,
+        radius,
+        "Admittance real(Y_s)",
+        elev=elev,
+        azim=azim,
+    )
+    ax_imag = fig.add_subplot(gs[0, 2], projection="3d")
+    _add_sphere_subplot(
+        ax_imag,
+        adm_vals.imag,
+        norm_imag,
+        cmap,
+        tri_verts,
+        radius,
+        "Admittance imag(Y_s)",
+        elev=elev,
+        azim=azim,
+    )
 
     plt.tight_layout()
     plt.show()
@@ -819,16 +939,6 @@ def main():
         finally:
             _update_button_states()
 
-    btn_clear = tk.Button(
-        frm,
-        text="Clear figures/data",
-        command=lambda: run_step(
-            btn_clear,
-            lambda: _clear_outputs(lambda msg: _log(log_widget, msg)),
-        ),
-    )
-    btn_clear.grid(row=0, column=0, padx=4, pady=(0, 6), sticky="w")
-
     def _solution_exists(label: str) -> bool:
         return (STATE_DIR / f"solution_{label}.pt").exists()
 
@@ -861,7 +971,6 @@ def main():
         iter_ok = _solution_exists("iterative")
         _set_button_state(btn_step1b, grid_ok)
         _set_button_state(btn_step1b_power, grid_ok)
-        _set_button_state(btn_step1c, grid_ok)
         _set_button_state(btn_step2, grid_ok)
         _set_button_state(btn_step4_first, ambient_ok)
         _set_button_state(btn_step5_self, ambient_ok)
@@ -895,20 +1004,26 @@ def main():
     ttk.Label(frm, text="lmax").grid(row=1, column=7, sticky="e")
     lmax_var = tk.StringVar(value="35")
     ttk.Entry(frm, textvariable=lmax_var, width=6).grid(row=1, column=8, sticky="w")
-    ttk.Label(frm, text="checker subdivs").grid(row=2, column=1, sticky="e")
-    div_var = tk.StringVar(value="2")
-    ttk.Entry(frm, textvariable=div_var, width=6).grid(row=2, column=2, sticky="w")
     sh_count_var = tk.StringVar(value="1296")
     ttk.Label(frm, text="# SH coeffs=").grid(row=2, column=3, sticky="e")
     ttk.Label(frm, textvariable=sh_count_var).grid(row=2, column=4, sticky="w")
     default_cfg = GridConfig(nside=1, lmax=1, radius_m=1.56e6, device="cpu")
     default_mean = 2.0 * default_cfg.seawater_conductivity_s_per_m * default_cfg.ocean_thickness_m
-    ttk.Label(frm, text="checker mean (S)").grid(row=3, column=1, sticky="e")
-    checker_mean_var = tk.StringVar(value=f"{default_mean:.3e}")
-    ttk.Entry(frm, textvariable=checker_mean_var, width=10).grid(row=3, column=2, sticky="w")
-    ttk.Label(frm, text="contrast (%)").grid(row=3, column=3, sticky="e")
-    checker_contrast_var = tk.StringVar(value="5")
-    ttk.Entry(frm, textvariable=checker_contrast_var, width=6).grid(row=3, column=4, sticky="w")
+    ttk.Label(frm, text="mean conductivity (S)").grid(row=3, column=1, sticky="e")
+    mean_cond_var = tk.StringVar(value=f"{default_mean:.3e}")
+    ttk.Entry(frm, textvariable=mean_cond_var, width=10).grid(row=3, column=2, sticky="w")
+    ttk.Label(frm, text="target l").grid(row=3, column=3, sticky="e")
+    mode_l_var = tk.StringVar(value="10")
+    ttk.Entry(frm, textvariable=mode_l_var, width=6).grid(row=3, column=4, sticky="w")
+    ttk.Label(frm, text="target |m|").grid(row=3, column=5, sticky="e")
+    mode_m_var = tk.StringVar(value="2")
+    ttk.Entry(frm, textvariable=mode_m_var, width=6).grid(row=3, column=6, sticky="w")
+    ttk.Label(frm, text="frac RMS").grid(row=3, column=7, sticky="e")
+    frac_rms_var = tk.StringVar(value="0.05")
+    ttk.Entry(frm, textvariable=frac_rms_var, width=6).grid(row=3, column=8, sticky="w")
+    ttk.Label(frm, text="inductance scale (x)").grid(row=2, column=6, sticky="e")
+    inductance_scale_var = tk.StringVar(value="1.0")
+    ttk.Entry(frm, textvariable=inductance_scale_var, width=6).grid(row=2, column=7, sticky="w")
     btn_l_from_faces = tk.Button(
         frm,
         text="Set lmax from faces",
@@ -931,17 +1046,22 @@ def main():
     btn_l_from_faces.grid(row=2, column=5, padx=4, sticky="w")
     btn_step1 = tk.Button(
         frm,
-        text="Run Step 1",
+        text="Clear + Run Step 1",
         command=lambda: run_step(
             btn_step1,
-            lambda: step1_build_grid_admittance(
-                int(subdiv_var.get()),
-                int(lmax_var.get()),
-                int(div_var.get()),
-                float(checker_mean_var.get()),
-                float(checker_contrast_var.get()),
-                lambda msg: _log(log_widget, msg),
-            ),
+            lambda: (
+                _clear_outputs(lambda msg: _log(log_widget, msg)),
+                step1_build_grid_admittance(
+                    int(subdiv_var.get()),
+                    int(lmax_var.get()),
+                    float(mean_cond_var.get()),
+                    float(frac_rms_var.get()),
+                    int(mode_l_var.get()),
+                    int(mode_m_var.get()),
+                    float(inductance_scale_var.get()),
+                    lambda msg: _log(log_widget, msg),
+                ),
+            )[1],
             on_success=lambda res: (
                 subdiv_var.set(str(res[1]) if isinstance(res, tuple) and len(res) > 1 else "?"),
                 faces_var.set(str(res[3]) if isinstance(res, tuple) and len(res) > 3 else "?"),
@@ -952,22 +1072,22 @@ def main():
             ),
         ),
     )
-    btn_step1.grid(row=1, column=3, padx=6, sticky="w")
+    btn_step1.grid(row=3, column=9, padx=6, sticky="w")
     ttk.Label(frm, text="iter order").grid(row=1, column=4, sticky="e")
     iter_order_var = tk.StringVar(value="3")
     ttk.Entry(frm, textvariable=iter_order_var, width=6).grid(row=1, column=5, sticky="w")
 
     # Step 1b
-    ttk.Label(frm, text="Step 1b: Roundtrip check").grid(row=4, column=0, sticky="w")
+    ttk.Label(frm, text="Step 1b: Admittance check").grid(row=4, column=0, sticky="w")
     btn_step1b = tk.Button(
         frm,
-        text="Plot admittance roundtrip",
+        text="Admittance plots",
         command=lambda: run_step_ui(btn_step1b, lambda: step1b_plot_roundtrip(lambda msg: _log(log_widget, msg))),
     )
     btn_step1b.grid(row=4, column=2, padx=6, sticky="w")
     btn_step1b_power = tk.Button(
         frm,
-        text="Admittance power (l,m)",
+        text="Admittance magnitude (l,m)",
         command=lambda: run_step_ui(
             btn_step1b_power,
             lambda: step1b_plot_admittance_power(lambda msg: _log(log_widget, msg)),
@@ -975,26 +1095,17 @@ def main():
     )
     btn_step1b_power.grid(row=4, column=3, padx=6, sticky="w")
 
-    # Step 1c
-    ttk.Label(frm, text="Step 1c: Roundtrip stability").grid(row=5, column=0, sticky="w")
-    btn_step1c = tk.Button(
-        frm,
-        text="Plot roundtrip 1 vs 2",
-        command=lambda: run_step_ui(btn_step1c, lambda: step1c_plot_roundtrip_stability(lambda msg: _log(log_widget, msg))),
-    )
-    btn_step1c.grid(row=5, column=2, padx=6, sticky="w")
-
     # Step 2
-    ttk.Label(frm, text="Step 2: Ambient field").grid(row=6, column=0, sticky="w")
+    ttk.Label(frm, text="Step 2: Ambient field").grid(row=5, column=0, sticky="w")
     btn_step2 = tk.Button(
         frm,
         text="Build ambient",
         command=lambda: run_step(btn_step2, lambda: step2_build_ambient(lambda msg: _log(log_widget, msg))),
     )
-    btn_step2.grid(row=6, column=2, padx=6, sticky="w")
+    btn_step2.grid(row=5, column=2, padx=6, sticky="w")
 
     # Step 4: First-order solve + plots
-    ttk.Label(frm, text="Step 4: First-order solve").grid(row=7, column=0, sticky="w")
+    ttk.Label(frm, text="Step 4: First-order solve").grid(row=6, column=0, sticky="w")
     btn_step4_first = tk.Button(
         frm,
         text="Solve first-order",
@@ -1003,7 +1114,7 @@ def main():
             lambda: step3_solve_currents(True, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step4_first.grid(row=7, column=2, padx=4, sticky="w")
+    btn_step4_first.grid(row=6, column=2, padx=4, sticky="w")
     btn_overview_first = tk.Button(
         frm,
         text="Overview (first-order)",
@@ -1014,7 +1125,7 @@ def main():
             lambda: step4_render_overview("first_order", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_first.grid(row=7, column=3, padx=4, sticky="w")
+    btn_overview_first.grid(row=6, column=3, padx=4, sticky="w")
     btn_grad0_first = tk.Button(
         frm,
         text="Gradients @ surface (first-order)",
@@ -1025,7 +1136,7 @@ def main():
             lambda: step4_render_gradient("first_order", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_first.grid(row=7, column=4, padx=4, sticky="w")
+    btn_grad0_first.grid(row=6, column=4, padx=4, sticky="w")
     btn_grad100_first = tk.Button(
         frm,
         text="Gradients @ 100 km (first-order)",
@@ -1036,7 +1147,7 @@ def main():
             lambda: step4_render_gradient("first_order", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_first.grid(row=7, column=5, padx=4, sticky="w")
+    btn_grad100_first.grid(row=6, column=5, padx=4, sticky="w")
     btn_harm_first = tk.Button(
         frm,
         text="Harmonics (ambient vs emitted)",
@@ -1047,10 +1158,10 @@ def main():
             lambda: step4_plot_harmonics("first_order", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_harm_first.grid(row=7, column=6, padx=4, sticky="w")
+    btn_harm_first.grid(row=6, column=6, padx=4, sticky="w")
 
     # Step 5: Self-consistent solve + plots
-    ttk.Label(frm, text="Step 5: Self-consistent solve").grid(row=8, column=0, sticky="w")
+    ttk.Label(frm, text="Step 5: Self-consistent solve").grid(row=7, column=0, sticky="w")
     btn_step5_self = tk.Button(
         frm,
         text="Solve self-consistent",
@@ -1059,7 +1170,7 @@ def main():
             lambda: step3_solve_currents(False, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step5_self.grid(row=8, column=2, padx=4, sticky="w")
+    btn_step5_self.grid(row=7, column=2, padx=4, sticky="w")
     btn_overview_self = tk.Button(
         frm,
         text="Overview (self-consistent)",
@@ -1070,7 +1181,7 @@ def main():
             lambda: step4_render_overview("self_consistent", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_self.grid(row=8, column=3, padx=4, sticky="w")
+    btn_overview_self.grid(row=7, column=3, padx=4, sticky="w")
     btn_grad0_self = tk.Button(
         frm,
         text="Gradients @ surface (self-consistent)",
@@ -1081,7 +1192,7 @@ def main():
             lambda: step4_render_gradient("self_consistent", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_self.grid(row=8, column=4, padx=4, sticky="w")
+    btn_grad0_self.grid(row=7, column=4, padx=4, sticky="w")
     btn_grad100_self = tk.Button(
         frm,
         text="Gradients @ 100 km (self-consistent)",
@@ -1092,7 +1203,7 @@ def main():
             lambda: step4_render_gradient("self_consistent", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_self.grid(row=8, column=5, padx=4, sticky="w")
+    btn_grad100_self.grid(row=7, column=5, padx=4, sticky="w")
     btn_harm_self = tk.Button(
         frm,
         text="Harmonics (ambient vs emitted)",
@@ -1103,10 +1214,10 @@ def main():
             lambda: step4_plot_harmonics("self_consistent", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_harm_self.grid(row=8, column=6, padx=4, sticky="w")
+    btn_harm_self.grid(row=7, column=6, padx=4, sticky="w")
 
     # Step 6: Iterative series solve + plots
-    ttk.Label(frm, text="Step 6: Iterative solve").grid(row=9, column=0, sticky="w")
+    ttk.Label(frm, text="Step 6: Iterative solve").grid(row=8, column=0, sticky="w")
     btn_step6_iter = tk.Button(
         frm,
         text="Solve iterative",
@@ -1115,7 +1226,7 @@ def main():
             lambda: step6_iterative_solve(int(iter_order_var.get()), lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step6_iter.grid(row=9, column=2, padx=4, sticky="w")
+    btn_step6_iter.grid(row=8, column=2, padx=4, sticky="w")
     btn_overview_iter = tk.Button(
         frm,
         text="Overview (iterative)",
@@ -1126,7 +1237,7 @@ def main():
             lambda: step4_render_overview("iterative", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_overview_iter.grid(row=9, column=3, padx=4, sticky="w")
+    btn_overview_iter.grid(row=8, column=3, padx=4, sticky="w")
     btn_grad0_iter = tk.Button(
         frm,
         text="Gradients @ surface (iterative)",
@@ -1137,7 +1248,7 @@ def main():
             lambda: step4_render_gradient("iterative", 0.0, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad0_iter.grid(row=9, column=4, padx=4, sticky="w")
+    btn_grad0_iter.grid(row=8, column=4, padx=4, sticky="w")
     btn_grad100_iter = tk.Button(
         frm,
         text="Gradients @ 100 km (iterative)",
@@ -1148,7 +1259,7 @@ def main():
             lambda: step4_render_gradient("iterative", 100e3, lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_grad100_iter.grid(row=9, column=5, padx=4, sticky="w")
+    btn_grad100_iter.grid(row=8, column=5, padx=4, sticky="w")
     btn_harm_iter = tk.Button(
         frm,
         text="Harmonics (ambient vs emitted)",
@@ -1159,7 +1270,7 @@ def main():
             lambda: step4_plot_harmonics("iterative", lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_harm_iter.grid(row=9, column=6, padx=4, sticky="w")
+    btn_harm_iter.grid(row=8, column=6, padx=4, sticky="w")
 
     frm.rowconfigure(11, weight=1)
     frm.columnconfigure(6, weight=1)
