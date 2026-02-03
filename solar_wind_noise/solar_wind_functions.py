@@ -38,7 +38,104 @@ def solar_wind_function(f, df):
     return combined_power_law(f, alpha1, C1, alpha2, C2, alpha3, C3)
 
 
-def generate_white_noise(T, fs):
+def gradiometer_solar_wind_function(
+    f,
+    df,
+    gradiometer_length,
+    angle_to_solar_wind=0.0,
+    magnetosonic_velocity=EuropaProperties().magnetosonic_velocity,
+    number_of_points=5,
+):
+    """Return the solar-wind PSD as seen by a multipoint gradiometer differencer.
+
+    Parameters:
+    - f: Frequency array in Hz.
+    - df: Frequency bin width in Hz (included for interface compatibility).
+    - gradiometer_length: Sensor separation in meters.
+    - angle_to_solar_wind: Angle (radians) between gradiometer baseline and flow.
+      A value of 0 means aligned with the solar-wind direction.
+    - magnetosonic_velocity: Advection speed in m/s used for frozen-in mapping.
+    - number_of_points: Number of points in the gradiometer model.
+      Special cases:
+        * 1: single-point field measurement (no differencing).
+        * 2: two-point endpoint difference across the full baseline.
+      For values >= 3, must be an odd integer and uses a central-difference stencil.
+    """
+    transfer_power = gradiometer_transfer_power(
+        f=f,
+        gradiometer_length=gradiometer_length,
+        angle_to_solar_wind=angle_to_solar_wind,
+        magnetosonic_velocity=magnetosonic_velocity,
+        number_of_points=number_of_points,
+    )
+    return transfer_power * solar_wind_function(f, df)
+
+
+def gradiometer_transfer_power(
+    f,
+    gradiometer_length,
+    angle_to_solar_wind=0.0,
+    magnetosonic_velocity=EuropaProperties().magnetosonic_velocity,
+    number_of_points=5,
+):
+    """Return peak-normalized gradiometer transfer power |H(f)|^2 (dimensionless)."""
+    if gradiometer_length <= 0:
+        raise ValueError("gradiometer_length must be positive.")
+    if magnetosonic_velocity <= 0:
+        raise ValueError("magnetosonic_velocity must be positive.")
+    if number_of_points < 1 or int(number_of_points) != number_of_points:
+        raise ValueError("number_of_points must be an integer >= 1.")
+
+    d_parallel = gradiometer_length * np.cos(angle_to_solar_wind)
+    angular_frequency = 2 * np.pi * f
+
+    if number_of_points == 1:
+        return np.ones_like(f, dtype=float)
+
+    if number_of_points == 2:
+        delay = d_parallel / magnetosonic_velocity
+        transfer = np.exp(1j * angular_frequency * delay) - 1.0
+        transfer_power = np.abs(transfer) ** 2
+        peak = np.max(transfer_power)
+        return transfer_power / peak if peak > 0 else transfer_power
+
+    offsets, coeffs = central_difference_coefficients(number_of_points)
+    delay_step = d_parallel / magnetosonic_velocity / (number_of_points - 1)
+    transfer = np.zeros_like(f, dtype=np.complex128)
+    for offset, coeff in zip(offsets, coeffs):
+        transfer += coeff * np.exp(1j * angular_frequency * offset * delay_step)
+    transfer_power = np.abs(transfer) ** 2
+    peak = np.max(transfer_power)
+    return transfer_power / peak if peak > 0 else transfer_power
+
+
+def central_difference_coefficients(number_of_points):
+    """Return offsets and coefficients for a central finite-difference gradiometer.
+
+    The returned coefficients estimate a first derivative and are scaled by the
+    total baseline so that they reduce to a simple two-endpoint difference for
+    a 3-point stencil.
+    """
+    if number_of_points < 3 or number_of_points % 2 == 0:
+        raise ValueError(
+            "For central-difference coefficients, number_of_points must be an odd integer >= 3."
+        )
+
+    half_width = number_of_points // 2
+    offsets = np.arange(-half_width, half_width + 1, dtype=int)
+
+    # Solve moment-matching equations for first-derivative weights at x=0, h=1.
+    system = np.array([offsets.astype(float) ** p for p in range(number_of_points)])
+    rhs = np.zeros(number_of_points, dtype=float)
+    rhs[1] = 1.0
+    derivative_weights = np.linalg.solve(system, rhs)
+
+    # Scale by the full baseline length so output is "difference-like" in nT.
+    coefficients = (number_of_points - 1) * derivative_weights
+    return offsets, coefficients
+
+
+def generate_white_noise(T, fs, rng=None):
     """Generate white noise with RMS value of 1.
 
     Parameters:
@@ -54,11 +151,14 @@ def generate_white_noise(T, fs):
     - non_neg_freqs: Frequencies that are non-negative.
     - delta_f: Width of each frequency bin.
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
     # Number of samples
     N = int(T * fs)
 
     # Generate white noise with RMS value of 1
-    noise = np.random.randn(N)
+    noise = rng.standard_normal(N)
 
     # Times
     times = np.linspace(0, T, N, endpoint=False)
@@ -144,7 +244,7 @@ def time_domain_variance(time_sample):
     return variance
 
 
-def compute_noise_sample(T_sample, fs_sample, func):
+def compute_noise_sample(T_sample, fs_sample, func, rng=None):
     """Generate a noise realization with a target PSD.
 
     Parameters:
@@ -154,7 +254,7 @@ def compute_noise_sample(T_sample, fs_sample, func):
     """
     # white noise with variance = 1
     noise_sample, times_sample, dt, fft_sample, freqs_sample, non_neg_freqs, df = generate_white_noise(
-        T_sample, fs_sample
+        T_sample, fs_sample, rng=rng
     )
 
     # power law blows up at low frequency
@@ -176,7 +276,7 @@ def compute_noise_sample(T_sample, fs_sample, func):
     return solar_wind_signal, times_sample, solar_wind_fft, freqs_sample, normalization, PSD, df
 
 
-def compute_average_psd(T_sample, fs_sample, number_of_samples, func):
+def compute_average_psd(T_sample, fs_sample, number_of_samples, func, seed=None):
     """Average PSD across multiple noise realizations.
 
     Parameters:
@@ -184,12 +284,15 @@ def compute_average_psd(T_sample, fs_sample, number_of_samples, func):
     - fs_sample: Sampling frequency in Hz.
     - number_of_samples: Number of realizations to average.
     - func: PSD function taking (freqs, df) and returning PSD values.
+    - seed: Optional random seed for reproducible realizations.
     """
+    rng = np.random.default_rng(seed)
+
     a = 0.0
     diff_power = 0.0
     for _ in range(number_of_samples):
         noise_t, t, noise_f, f, normalization, PSD, df = compute_noise_sample(
-            T_sample=T_sample, fs_sample=fs_sample, func=func
+            T_sample=T_sample, fs_sample=fs_sample, func=func, rng=rng
         )
         a = a + np.abs(noise_f) ** 2
         diff = noise_t[-1] - noise_t[0]
@@ -201,7 +304,21 @@ def compute_average_psd(T_sample, fs_sample, number_of_samples, func):
     return noise_t, t, noise_f, f, normalization, PSD, df, PSD_ave, diff_rms
 
 
-def plot_noise_results(f, PSD_ave, PSD_theory, t, noise_t, position, diff_t=None, t_diff=None):
+def plot_noise_results(
+    f,
+    PSD_ave,
+    PSD_theory,
+    t,
+    noise_t,
+    position,
+    gradiometer_psd_ave=None,
+    gradiometer_psd_theory=None,
+    gradiometer_transfer_power=None,
+    gradiometer_transfer_frequency=None,
+    gradiometer_noise_t=None,
+    gradiometer_t=None,
+    gradiometer_points=None,
+):
     """Plot PSD, time-domain signal, and position-domain signal.
 
     Parameters:
@@ -211,36 +328,85 @@ def plot_noise_results(f, PSD_ave, PSD_theory, t, noise_t, position, diff_t=None
     - t: Time array in seconds.
     - noise_t: Time-domain noise samples.
     - position: Position array in meters.
-    - diff_t: Optional time-domain gradiometer difference samples.
-    - t_diff: Optional time array for gradiometer difference.
+    - gradiometer_psd_ave: Optional averaged gradiometer PSD from realizations.
+    - gradiometer_psd_theory: Optional gradiometer PSD curve for differenced signal.
+    - gradiometer_transfer_power: Optional transfer power |H(f)|^2 for gradiometer.
+    - gradiometer_transfer_frequency: Optional frequency array for transfer-power plot.
+    - gradiometer_noise_t: Optional time-domain gradiometer noise samples.
+    - gradiometer_t: Optional time array for gradiometer noise samples.
+    - gradiometer_points: Optional integer count used in gradiometer plot titles.
     """
-    rows = 4 if diff_t is not None and t_diff is not None else 3
+    amplitude_scale = 1e3  # convert nT -> pT for plotting
+    psd_scale = amplitude_scale**2  # convert nT^2/Hz -> pT^2/Hz
+
+    rows = 3
+    if gradiometer_psd_theory is not None:
+        rows += 1
+    if gradiometer_transfer_power is not None:
+        rows += 1
+    if gradiometer_noise_t is not None and gradiometer_t is not None:
+        rows += 1
     fig, ax = plt.subplots(rows, 1, figsize=(10, 4 + 2 * rows))
 
+    # Frequency-domain plots should use positive frequencies only.
+    positive_freq_mask = f > 0
+    f_plot = f[positive_freq_mask]
+    psd_ave_plot = PSD_ave[positive_freq_mask] * psd_scale
+    psd_theory_plot = PSD_theory[positive_freq_mask] * psd_scale
+
     # Frequency domain
-    ax[0].loglog(f, PSD_ave)
-    ax[0].loglog(f, PSD_theory, c="red")
-    ax[0].set_title(" Noise Frequency Spectrum")
+    ax[0].loglog(f_plot, psd_ave_plot, linewidth=2.2)
+    ax[0].loglog(f_plot, psd_theory_plot, c="red")
+    ax[0].set_title("Noise Frequency Spectrum")
     ax[0].set_xlabel("Frequency [Hz]")
-    ax[0].set_ylabel("Amplitude")
+    ax[0].set_ylabel("PSD [pT^2/Hz]")
+
+    next_row = 1
+    if gradiometer_transfer_power is not None:
+        transfer_freq = f if gradiometer_transfer_frequency is None else gradiometer_transfer_frequency
+        transfer_mask = transfer_freq > 0
+        transfer_freq_plot = transfer_freq[transfer_mask]
+        transfer_power_plot = gradiometer_transfer_power[transfer_mask]
+        ax[next_row].semilogx(transfer_freq_plot, transfer_power_plot, linewidth=2.2)
+
+        ax[next_row].set_title("Gradiometer Transfer Power")
+        ax[next_row].set_xlabel("Frequency [Hz]")
+        ax[next_row].set_ylabel("Transfer Power [1]")
+        next_row += 1
+
+    if gradiometer_psd_theory is not None:
+        if gradiometer_psd_ave is not None:
+            gradiometer_psd_ave_plot = gradiometer_psd_ave[positive_freq_mask] * psd_scale
+            ax[next_row].loglog(f_plot, gradiometer_psd_ave_plot, linewidth=2.2)
+        gradiometer_psd_plot = gradiometer_psd_theory[positive_freq_mask] * psd_scale
+        ax[next_row].loglog(f_plot, gradiometer_psd_plot, c="red")
+        grad_title = "Noise Frequency Spectrum of the solar wind measured by the gradiometer"
+        if gradiometer_points is not None:
+            grad_title += f" ({gradiometer_points} points)"
+        ax[next_row].set_title(grad_title)
+        ax[next_row].set_xlabel("Frequency [Hz]")
+        ax[next_row].set_ylabel("PSD [pT^2/Hz]")
+        next_row += 1
 
     # Time domain
-    ax[1].plot(t, noise_t)
-    ax[1].set_title("White Noise Time Domain")
-    ax[1].set_xlabel("Time [s]")
-    ax[1].set_ylabel("Amplitude nT")
+    ax[next_row].plot(t, noise_t * amplitude_scale)
+    ax[next_row].set_title("Solar Wind Noise Time Domain")
+    ax[next_row].set_xlabel("Time [s]")
+    ax[next_row].set_ylabel("Amplitude [pT]")
+    next_row += 1
 
     # Position domain
-    ax[2].plot(position, noise_t)
-    ax[2].set_title("White Noise Space Domain")
-    ax[2].set_xlabel("position (m)")
-    ax[2].set_ylabel("Amplitude (nT)")
+    ax[next_row].plot(position, noise_t * amplitude_scale)
+    ax[next_row].set_title("Solar Wind Noise Space Domain")
+    ax[next_row].set_xlabel("Position [m]")
+    ax[next_row].set_ylabel("Amplitude [pT]")
+    next_row += 1
 
-    if rows == 4:
-        ax[3].plot(t_diff, diff_t)
-        ax[3].set_title("Gradiometer Difference (Time Domain)")
-        ax[3].set_xlabel("Time [s]")
-        ax[3].set_ylabel("Amplitude nT")
+    if gradiometer_noise_t is not None and gradiometer_t is not None:
+        ax[next_row].plot(gradiometer_t, gradiometer_noise_t * amplitude_scale)
+        ax[next_row].set_title("Gradiometer Noise Time Domain (Last Realization)")
+        ax[next_row].set_xlabel("Time [s]")
+        ax[next_row].set_ylabel("Amplitude [pT]")
 
     plt.tight_layout()
     plt.show()
