@@ -28,9 +28,9 @@ Recommended scripts to run
 - Shorter/faster PSD sweep:
   - check_noise2.py
 - End-to-end generation and plotting (10 m baseline):
-  - generate_noise_10_m.py
+  - generate_noise_10_m_high_freq.py
 - End-to-end generation and plotting (100 km baseline):
-  - generate noise_100_km.py
+  - generate noise_100_km_high_freq.py
 
 Core components and what they do
 - noise_functions.py
@@ -50,7 +50,7 @@ Core components and what they do
   - Models SQUID noise vs frequency (fT/vHz), enforces a floor, and converts
     it to PSD (nT^2/Hz) for addition to the solar-wind envelope.
 
-- generate_noise_10_m.py / generate noise_100_km.py
+- generate_noise_10_m_high_freq.py / generate noise_100_km_high_freq.py
   - Standalone scripts that:
     - generate white noise
     - shape it by the solar-wind PSD
