@@ -45,6 +45,7 @@ def gradiometer_solar_wind_function(
     angle_to_solar_wind=0.0,
     magnetosonic_velocity=EuropaProperties().magnetosonic_velocity,
     number_of_points=5,
+    output_quantity="difference",
 ):
     """Return the solar-wind PSD as seen by a multipoint gradiometer differencer.
 
@@ -67,6 +68,7 @@ def gradiometer_solar_wind_function(
         angle_to_solar_wind=angle_to_solar_wind,
         magnetosonic_velocity=magnetosonic_velocity,
         number_of_points=number_of_points,
+        output_quantity=output_quantity,
     )
     return transfer_power * solar_wind_function(f, df)
 
@@ -77,14 +79,25 @@ def gradiometer_transfer_power(
     angle_to_solar_wind=0.0,
     magnetosonic_velocity=EuropaProperties().magnetosonic_velocity,
     number_of_points=5,
+    output_quantity="difference",
 ):
-    """Return peak-normalized gradiometer transfer power |H(f)|^2 (dimensionless)."""
+    """Return gradiometer transfer power |H(f)|^2.
+
+    Parameters:
+    - output_quantity:
+      * "difference": transfer maps field [nT] to differenced field [nT]
+      * "gradient": transfer maps field [nT] to gradient [nT/m]
+    """
     if gradiometer_length <= 0:
         raise ValueError("gradiometer_length must be positive.")
     if magnetosonic_velocity <= 0:
         raise ValueError("magnetosonic_velocity must be positive.")
     if number_of_points < 1 or int(number_of_points) != number_of_points:
         raise ValueError("number_of_points must be an integer >= 1.")
+    if output_quantity not in {"difference", "gradient"}:
+        raise ValueError("output_quantity must be 'difference' or 'gradient'.")
+    if output_quantity == "gradient" and number_of_points == 1:
+        raise ValueError("Gradient output requires number_of_points >= 2.")
 
     d_parallel = gradiometer_length * np.cos(angle_to_solar_wind)
     angular_frequency = 2 * np.pi * f
@@ -95,18 +108,20 @@ def gradiometer_transfer_power(
     if number_of_points == 2:
         delay = d_parallel / magnetosonic_velocity
         transfer = np.exp(1j * angular_frequency * delay) - 1.0
+        if output_quantity == "gradient":
+            transfer = transfer / gradiometer_length
         transfer_power = np.abs(transfer) ** 2
-        peak = np.max(transfer_power)
-        return transfer_power / peak if peak > 0 else transfer_power
+        return transfer_power
 
     offsets, coeffs = central_difference_coefficients(number_of_points)
     delay_step = d_parallel / magnetosonic_velocity / (number_of_points - 1)
     transfer = np.zeros_like(f, dtype=np.complex128)
     for offset, coeff in zip(offsets, coeffs):
         transfer += coeff * np.exp(1j * angular_frequency * offset * delay_step)
+    if output_quantity == "gradient":
+        transfer = transfer / gradiometer_length
     transfer_power = np.abs(transfer) ** 2
-    peak = np.max(transfer_power)
-    return transfer_power / peak if peak > 0 else transfer_power
+    return transfer_power
 
 
 def central_difference_coefficients(number_of_points):
@@ -318,6 +333,11 @@ def plot_noise_results(
     gradiometer_noise_t=None,
     gradiometer_t=None,
     gradiometer_points=None,
+    gradiometer_amplitude_scale=None,
+    gradiometer_psd_scale=None,
+    gradiometer_amplitude_label="Amplitude [pT]",
+    gradiometer_psd_label="PSD [pT^2/Hz]",
+    gradiometer_plot_asd=False,
 ):
     """Plot PSD, time-domain signal, and position-domain signal.
 
@@ -338,6 +358,10 @@ def plot_noise_results(
     """
     amplitude_scale = 1e3  # convert nT -> pT for plotting
     psd_scale = amplitude_scale**2  # convert nT^2/Hz -> pT^2/Hz
+    if gradiometer_amplitude_scale is None:
+        gradiometer_amplitude_scale = amplitude_scale
+    if gradiometer_psd_scale is None:
+        gradiometer_psd_scale = psd_scale
 
     num_plots = 3
     if gradiometer_psd_theory is not None:
@@ -380,16 +404,20 @@ def plot_noise_results(
 
     if gradiometer_psd_theory is not None:
         if gradiometer_psd_ave is not None:
-            gradiometer_psd_ave_plot = gradiometer_psd_ave[positive_freq_mask] * psd_scale
+            gradiometer_psd_ave_plot = gradiometer_psd_ave[positive_freq_mask] * gradiometer_psd_scale
+            if gradiometer_plot_asd:
+                gradiometer_psd_ave_plot = np.sqrt(np.maximum(gradiometer_psd_ave_plot, 0.0))
             ax[next_plot].loglog(f_plot, gradiometer_psd_ave_plot, linewidth=2.2)
-        gradiometer_psd_plot = gradiometer_psd_theory[positive_freq_mask] * psd_scale
+        gradiometer_psd_plot = gradiometer_psd_theory[positive_freq_mask] * gradiometer_psd_scale
+        if gradiometer_plot_asd:
+            gradiometer_psd_plot = np.sqrt(np.maximum(gradiometer_psd_plot, 0.0))
         ax[next_plot].loglog(f_plot, gradiometer_psd_plot, c="red")
         grad_title = "Noise Frequency Spectrum of the solar wind measured by the gradiometer"
         if gradiometer_points is not None:
             grad_title += f" ({gradiometer_points} points)"
         ax[next_plot].set_title(grad_title)
         ax[next_plot].set_xlabel("Frequency [Hz]")
-        ax[next_plot].set_ylabel("PSD [pT^2/Hz]")
+        ax[next_plot].set_ylabel(gradiometer_psd_label)
         next_plot += 1
 
     # Time domain
@@ -407,10 +435,10 @@ def plot_noise_results(
     next_plot += 1
 
     if gradiometer_noise_t is not None and gradiometer_t is not None:
-        ax[next_plot].plot(gradiometer_t, gradiometer_noise_t * amplitude_scale)
+        ax[next_plot].plot(gradiometer_t, gradiometer_noise_t * gradiometer_amplitude_scale)
         ax[next_plot].set_title("Gradiometer Noise Time Domain (Last Realization)")
         ax[next_plot].set_xlabel("Time [s]")
-        ax[next_plot].set_ylabel("Amplitude [pT]")
+        ax[next_plot].set_ylabel(gradiometer_amplitude_label)
         next_plot += 1
 
     for i in range(next_plot, len(ax)):

@@ -53,6 +53,7 @@ Europa_transit_time = europa.transit_time
 
 gradiometer_length=10  # m
 gradiometer_points = 5  # odd number of points for gradiometer PSD model
+gradiometer_output_quantity = "gradient"  # report gradient in nT/m (later plotted as pT/m)
 
 sample_period = 0.01  # 10 ms sampling cadence
 sample_frequency = 1.0 / sample_period
@@ -91,6 +92,7 @@ noise_t, t, noise_f, f, normalization, PSD, df, PSD_ave, diff_rms = compute_aver
         gradiometer_length=gradiometer_length,
         magnetosonic_velocity=magnetosonic_velocity,
         number_of_points=gradiometer_points,
+        output_quantity=gradiometer_output_quantity,
     ),
 )
 
@@ -119,13 +121,18 @@ gradiometer_psd_theory = gradiometer_solar_wind_function(
     gradiometer_length=gradiometer_length,
     magnetosonic_velocity=magnetosonic_velocity,
     number_of_points=gradiometer_points,
+    output_quantity=gradiometer_output_quantity,
 )
 gradiometer_transfer_theory = gradiometer_transfer_power(
     f=f,
     gradiometer_length=gradiometer_length,
     magnetosonic_velocity=magnetosonic_velocity,
     number_of_points=gradiometer_points,
+    output_quantity=gradiometer_output_quantity,
 )
+
+gradiometer_amplitude_scale = 1e3  # nT/m -> pT/m
+gradiometer_psd_scale = gradiometer_amplitude_scale**2  # (nT/m)^2/Hz -> (pT/m)^2/Hz
 
 plot_noise_results(
     f=f,
@@ -141,6 +148,11 @@ plot_noise_results(
     gradiometer_noise_t=noise_grad_plot,
     gradiometer_t=t_grad_plot,
     gradiometer_points=gradiometer_points,
+    gradiometer_amplitude_scale=gradiometer_amplitude_scale,
+    gradiometer_psd_scale=gradiometer_psd_scale,
+    gradiometer_amplitude_label="Amplitude [pT/m]",
+    gradiometer_psd_label="ASD [pT/(m*Hz^0.5)]",
+    gradiometer_plot_asd=True,
 )
 
 lag_noise, corr_noise, err_noise = centered_correlation(noise_t, sample_period)
