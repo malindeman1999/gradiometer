@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from render_phasor_maps import _build_mesh
+from workflow.plotting.render_phasor_maps import _build_mesh
 
 # Matches workflow_* defaults (Europa mean radius in meters)
 EUROPA_RADIUS_M = 1.56e6

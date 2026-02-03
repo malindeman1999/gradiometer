@@ -1,7 +1,7 @@
 import torch
 
-from europa import grid
-from europa.config import GridConfig
+from europa_model import grid
+from europa_model.config import GridConfig
 
 
 def test_neighbors_no_nan():

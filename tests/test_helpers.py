@@ -1,4 +1,4 @@
-from europa import helpers
+from europa_model import helpers
 import torch
 
 

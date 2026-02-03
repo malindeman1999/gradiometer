@@ -1,7 +1,7 @@
 import torch
 
-from europa.config import GridConfig, AmbientConfig, SolverConfig, ObservationConfig, VisualizationConfig, ModelConfig
-from europa.simulation import Simulation
+from europa_model.config import GridConfig, AmbientConfig, SolverConfig, ObservationConfig, VisualizationConfig, ModelConfig
+from europa_model.simulation import Simulation
 
 
 def test_simulation_runs():

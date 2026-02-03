@@ -1,6 +1,6 @@
 import torch
 
-from europa import diagnostics, inductance
+from europa_model import diagnostics, inductance
 
 
 def test_divergence_spectral_toroidal_zero():

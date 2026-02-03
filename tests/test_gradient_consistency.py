@@ -10,13 +10,13 @@ if __package__ in (None, ""):
     ROOT = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(ROOT))
 
-from europa.gradient_utils import (
+from europa_model.gradient_utils import (
     sph_to_cart_coords,
     spherical_components_to_cart,
     toroidal_field_spherical,
     toroidal_gradients_spherical,
 )
-from europa import inductance
+from europa_model import inductance
 
 
 def _err_stats(actual, expected):
@@ -59,7 +59,7 @@ def test_spherical_gradients_match_numeric():
     grad_true_normed = grad_true / 1e9
 
     # numeric spherical gradients via finite differencing on r/theta/phi by re-evaluating the field
-    from europa.gradient_utils import finite_diff_gradients_spherical
+    from europa_model.gradient_utils import finite_diff_gradients_spherical
     Btor, Bpol, Brad = inductance.spectral_b_from_surface_currents(J, torch.zeros_like(J), radius=R)
     grad_fd = finite_diff_gradients_spherical(
         B_tor=Btor,

@@ -1,6 +1,6 @@
 import torch
 
-from europa.gradient_utils import rss_gradient_cartesian_autograd, toroidal_field_and_gradients_spherical
+from europa_model.gradient_utils import rss_gradient_cartesian_autograd, toroidal_field_and_gradients_spherical
 
 
 def test_rss_autograd_matches_analytic_toroidal():

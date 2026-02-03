@@ -1,6 +1,6 @@
 import torch
 
-from europa import transforms
+from europa_model import transforms
 
 
 def test_sh_roundtrip():

@@ -120,7 +120,7 @@ def main() -> None:
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=Path("data/gaunt_cache_wigxjpf"),
+        default=Path("gaunt/data/gaunt_cache_wigxjpf"),
         help="Directory containing shell checkpoint files.",
     )
     parser.add_argument("--rtol", type=float, default=1e-6, help="Relative tolerance for value comparison.")

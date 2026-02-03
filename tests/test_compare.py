@@ -1,6 +1,6 @@
 import torch
 
-from europa import compare_td_fd
+from europa_model import compare_td_fd
 
 
 def test_compare_shapes():

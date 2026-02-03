@@ -1,6 +1,6 @@
 import torch
 
-from europa import inductance, observation
+from europa_model import inductance, observation
 
 
 def test_spectral_mapping_swaps_components():

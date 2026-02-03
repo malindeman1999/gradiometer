@@ -34,7 +34,7 @@ LMAX_OUT = LMAX
 LMAX_Y = LMAX
 LMAX_B = LMAX
 # Store checkpoints in the shared Gaunt cache directory (no L suffix).
-CACHE_DIR = Path("data/gaunt_cache_wigxjpf")
+CACHE_DIR = Path("gaunt/data/gaunt_cache_wigxjpf")
 
 
 def _checkpoint_path(cache_dir: Path, L: int) -> Path:

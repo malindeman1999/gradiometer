@@ -330,8 +330,8 @@ def assemble(cache_dir: Path, output_path: Path, verbose: bool = False, plot: bo
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Assemble Gaunt checkpoints into a single sparse tensor.")
-    parser.add_argument("--cache-dir", default="data/gaunt_cache_wigxjpf", type=Path, help="Directory containing checkpoint files.")
-    parser.add_argument("--output", default="data/gaunt_cache_wigxjpf/gaunt_wigxjpf_assembled.pt", type=Path, help="Output path for assembled tensor.")
+    parser.add_argument("--cache-dir", default="gaunt/data/gaunt_cache_wigxjpf", type=Path, help="Directory containing checkpoint files.")
+    parser.add_argument("--output", default="gaunt/data/gaunt_cache_wigxjpf/gaunt_wigxjpf_assembled.pt", type=Path, help="Output path for assembled tensor.")
     parser.add_argument("--verbose", action="store_true", help="Print progress.")
     parser.add_argument("--no-plot", action="store_true", help="Suppress shell plot animation.")
     args = parser.parse_args()
