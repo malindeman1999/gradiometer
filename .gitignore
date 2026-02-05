@@ -47,3 +47,6 @@ build/
 results/
 outputs/
 artifacts/
+
+# Notes temp/lock files
+Notes/~$*
