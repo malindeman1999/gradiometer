@@ -12,6 +12,7 @@ import warnings
 import math
 
 import torch
+import numpy as np
 
 from europa_model import inductance
 from europa_model.observation import evaluate_field_from_spectral
@@ -425,30 +426,71 @@ def gradient_sanity_check(
     return out
 
 
-def render_gradient_map(sim: "PhasorSimulation", altitude_m: float, subdivisions: int, save_path: str, title: str) -> None:
+def render_gradient_map(
+    sim: "PhasorSimulation",
+    altitude_m: float,
+    save_path: str,
+    title: str,
+    faces: torch.Tensor | None = None,
+    plotter: str = "pyvista",
+    subdivisions: int = 0,
+) -> None:
     import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-    from workflow.plotting.render_phasor_maps import _build_mesh
+    from workflow.plotting.sphere_roundtrip import sphere_image
 
     radius = sim.radius_m + altitude_m
     scale = radius / sim.radius_m
     positions = (sim.grid_positions * scale).to(dtype=torch.float64)
+    rss = rss_gradient_from_emit(sim, positions, obs_radius=radius).cpu().numpy()
 
-    rss = rss_gradient_from_emit(sim, positions, obs_radius=radius)
+    pts = positions.detach().cpu().numpy()
+    if faces is None:
+        from scipy.spatial import ConvexHull
+        face_np = ConvexHull(pts).simplices.astype(np.int64)
+    else:
+        face_np = faces.detach().cpu().numpy() if isinstance(faces, torch.Tensor) else faces
+    if plotter == "pyvista":
+        pyvista_shown = False
+        try:
+            import pyvista as pv
 
-    vertices, faces, centers = _build_mesh(radius, subdivisions=subdivisions, stride=1)
-    positions = positions.to(dtype=centers.dtype)
+            face_prefix = np.full((face_np.shape[0], 1), 3, dtype=np.int64)
+            pv_faces = np.hstack((face_prefix, face_np)).reshape(-1)
+            mesh = pv.PolyData(pts, pv_faces)
+            mesh.point_data["value"] = rss
+            pl = pv.Plotter(off_screen=False, window_size=(1100, 900))
+            pl.set_background("white")
+            pl.add_mesh(
+                mesh,
+                scalars="value",
+                cmap="rainbow",
+                show_edges=False,
+                smooth_shading=False,
+                lighting=False,
+            )
+            pl.add_title(title)
+            pl.view_isometric()
+            pl.show(auto_close=False)
+            pyvista_shown = True
+            try:
+                pl.screenshot(save_path)
+            except Exception:
+                pass
+            pl.close()
+            return
+        except Exception:
+            if pyvista_shown:
+                return
 
-    dists = torch.cdist(centers, positions)
-    nearest = dists.argmin(dim=1)
-    face_vals = rss[nearest].cpu().numpy()
+    import matplotlib.colors as mcolors
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-    tri_verts = vertices[faces].cpu().numpy()
+    face_vals = rss[face_np].mean(axis=1)
+    tri_verts = pts[face_np]
     vmax = float(face_vals.max()) if face_vals.size else 1.0
     vmax = vmax if vmax > 0 else 1.0
     norm = mcolors.Normalize(vmin=0.0, vmax=vmax)
-    cmap = plt.get_cmap("inferno")
+    cmap = plt.get_cmap("rainbow")
     colors = cmap(norm(face_vals))
 
     fig = plt.figure(figsize=(7, 6))
@@ -461,7 +503,7 @@ def render_gradient_map(sim: "PhasorSimulation", altitude_m: float, subdivisions
         antialiased=True,
     )
     ax.add_collection3d(collection)
-    lim = radius * 1.05
+    lim = float(np.max(np.abs(pts))) * 1.05
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     ax.set_zlim(-lim, lim)
@@ -473,4 +515,4 @@ def render_gradient_map(sim: "PhasorSimulation", altitude_m: float, subdivisions
     fig.colorbar(mappable, ax=ax, shrink=0.8, pad=0.05, label="|grad_B_emit| RSS (T/m)")
     plt.tight_layout()
     plt.savefig(save_path, dpi=220, bbox_inches="tight")
-    plt.close(fig)
+    plt.show()
