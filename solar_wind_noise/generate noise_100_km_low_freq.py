@@ -4,19 +4,20 @@ Note: This script does not apply the gradiometer subtraction/filtering; it only
 generates the underlying noise field and its PSD.
 """
 
-import matplotlib.pyplot as plt
 import numpy as np
+import math
 
 from solar_wind_functions import (
     compute_average_psd,
+    central_difference_coefficients,
     EuropaProperties,
     gradiometer_solar_wind_function,
     gradiometer_transfer_power,
-    plot_noise_results,
     solar_wind_function,
     summarize_noise_results,
     uniform_PSD,
 )
+from plot_routines import plot_noise_results, centered_correlation, plot_centered_correlation
 
 
 
@@ -30,22 +31,6 @@ from solar_wind_functions import (
 func = solar_wind_function
 
 
-def centered_correlation(signal, sample_dt):
-    """Compute normalized autocorrelation and approximate 1-sigma errors."""
-    values = np.asarray(signal, dtype=float)
-    center = values.size // 2
-    half_window = min(center, values.size - center - 1)
-    window = values[center - half_window : center + half_window + 1]
-    window = window - np.mean(window)
-
-    correlation_raw = np.correlate(window, window, mode="full")
-    lags = np.arange(-(window.size - 1), window.size)
-    overlap = window.size - np.abs(lags)
-    correlation = correlation_raw / (np.var(window) * overlap)
-    corr_stderr = 1.0 / np.sqrt(overlap)
-    return lags * sample_dt, correlation, corr_stderr
-
-
 europa = EuropaProperties()
 magnetosonic_velocity = europa.magnetosonic_velocity
 Europa_transit_time = europa.transit_time
@@ -55,7 +40,7 @@ gradiometer_length=100e3  # m
 gradiometer_points = 2  # odd number of points for gradiometer PSD model
 gradiometer_output_quantity = "gradient"  # report gradient in nT/m (later plotted as pT/m)
 
-noise_period = 100.0  # lowest frequency is 1 / T = 0.01 Hz (10 mHz)
+noise_period = 1000.0  # lowest frequency is 1 / T = 0.001 Hz (1 mHz)
 sample_frequency = 200.0  # Nyquist = fs/2 = 100 Hz
 sample_period = 1.0 / sample_frequency
 
@@ -134,6 +119,36 @@ gradiometer_transfer_theory = gradiometer_transfer_power(
 gradiometer_amplitude_scale = 1e3  # nT/m -> pT/m
 gradiometer_psd_scale = gradiometer_amplitude_scale**2  # (nT/m)^2/Hz -> (pT/m)^2/Hz
 
+crossing_time_s = 114.483
+freq_max = 1.0 / crossing_time_s
+print(f"Node transit time: {crossing_time_s:.3f} s")
+print(f"RMS frequency range: 0 to {freq_max:.6e} Hz")
+band_mask = (f > 0.0) & (f <= freq_max)
+if np.any(band_mask):
+    band_variance = float(np.sum(gradiometer_psd_ave[band_mask]) * df)
+    band_rms = math.sqrt(max(band_variance, 0.0)) * gradiometer_amplitude_scale * 1e3
+    band_label = f"RMS = {band_rms:.1f} fT/m"
+    print(f"RMS noise: {band_rms:.1f} fT/m")
+    if gradiometer_points == 1:
+        weight_sq_sum = 1.0
+    elif gradiometer_points == 2:
+        weight_sq_sum = 2.0
+    else:
+        _, coeffs = central_difference_coefficients(gradiometer_points)
+        weight_sq_sum = float(np.sum(coeffs**2))
+    if gradiometer_output_quantity == "gradient":
+        weight_sq_sum = weight_sq_sum / (gradiometer_length**2)
+    sensor_psd_band = gradiometer_psd_ave[band_mask] * gradiometer_psd_scale
+    if weight_sq_sum > 0:
+        sensor_psd_band = sensor_psd_band / weight_sq_sum
+    sensor_rms = math.sqrt(float(np.sum(sensor_psd_band) * df)) if sensor_psd_band.size else float("nan")
+    sensor_rms_ft = sensor_rms * 1e3
+    sensor_label = f"RMS = {sensor_rms_ft:.1f} fT"
+else:
+    band_label = "RMS = N/A"
+    sensor_label = "RMS = N/A"
+    print("RMS noise: N/A")
+
 plot_noise_results(
     f=f,
     PSD_ave=PSD_ave,
@@ -148,48 +163,25 @@ plot_noise_results(
     gradiometer_noise_t=noise_grad_plot,
     gradiometer_t=t_grad_plot,
     gradiometer_points=gradiometer_points,
+    gradiometer_length=gradiometer_length,
+    gradiometer_output_quantity=gradiometer_output_quantity,
     gradiometer_amplitude_scale=gradiometer_amplitude_scale,
     gradiometer_psd_scale=gradiometer_psd_scale,
     gradiometer_amplitude_label="Amplitude [pT/m]",
-    gradiometer_psd_label="ASD [pT/(m*Hz^0.5)]",
+    gradiometer_psd_label="ASD [pT/(m*√Hz)]",
     gradiometer_plot_asd=True,
+    gradiometer_rms_band=(freq_max, band_label),
+    sensor_rms_band=(freq_max, sensor_label),
 )
 
+print("Computing centered correlation...")
 lag_noise, corr_noise, err_noise = centered_correlation(noise_t, sample_period)
 lag_grad, corr_grad, err_grad = centered_correlation(noise_t_grad, sample_period)
-positive_lag_mask = lag_noise > 0
-
-plt.figure(figsize=(10, 4))
-plt.errorbar(
-    lag_noise[positive_lag_mask],
-    corr_noise[positive_lag_mask],
-    yerr=err_noise[positive_lag_mask],
-    fmt="o",
-    markersize=2.5,
-    elinewidth=0.7,
-    capsize=0,
-    linestyle="none",
-    alpha=0.8,
-    label="Solar wind noise",
+plot_centered_correlation(
+    lag_noise,
+    corr_noise,
+    err_noise,
+    lag_grad,
+    corr_grad,
+    err_grad,
 )
-plt.errorbar(
-    lag_grad[positive_lag_mask],
-    corr_grad[positive_lag_mask],
-    yerr=err_grad[positive_lag_mask],
-    fmt="o",
-    markersize=2.5,
-    elinewidth=0.7,
-    capsize=0,
-    linestyle="none",
-    alpha=0.8,
-    label="Gradiometer noise",
-)
-plt.xscale("log")
-plt.title("Centered Correlation Function")
-plt.xlabel("Positive lag [s]")
-plt.ylabel("Correlation [1]")
-plt.ylim(-1.0, 1.0)
-plt.grid(alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.show()

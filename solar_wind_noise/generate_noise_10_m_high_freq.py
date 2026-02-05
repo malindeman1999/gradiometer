@@ -9,11 +9,11 @@ from solar_wind_functions import (
     EuropaProperties,
     gradiometer_solar_wind_function,
     gradiometer_transfer_power,
-    plot_noise_results,
     solar_wind_function,
     summarize_noise_results,
     uniform_PSD,
 )
+from plot_routines import plot_noise_results
 
 
 
@@ -130,10 +130,12 @@ plot_noise_results(
     gradiometer_noise_t=noise_grad_plot,
     gradiometer_t=t_grad_plot,
     gradiometer_points=gradiometer_points,
+    gradiometer_length=gradiometer_length,
+    gradiometer_output_quantity=gradiometer_output_quantity,
     gradiometer_amplitude_scale=gradiometer_amplitude_scale,
     gradiometer_psd_scale=gradiometer_psd_scale,
     gradiometer_amplitude_label="Amplitude [pT/m]",
-    gradiometer_psd_label="ASD [pT/(m*Hz^0.5)]",
+    gradiometer_psd_label="ASD [pT/(m*√Hz)]",
     gradiometer_plot_asd=True,
 )
 

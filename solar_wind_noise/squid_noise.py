@@ -1,5 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
 
 def power_law(f, alpha, C=1):
     """Power law function."""
@@ -46,7 +45,6 @@ def SQUID_PSD(frequencies):
     
     return PSD
 
-import matplotlib.pyplot as plt
 
 
 # frequencies = np.linspace(1e-5, 20000, 500)  # Frequencies from 1e-5 Hz to 10 kHz

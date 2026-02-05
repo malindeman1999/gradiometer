@@ -1,5 +1,6 @@
 import numpy as np
-import matplotlib.pyplot as plt
+
+from plot_routines import plot_power_law_demo
 
 def power_law(f, alpha, C=1):
     """Power law function."""
@@ -49,21 +50,21 @@ if __name__ == "__main__":
     # Combine the three curves by taking the minimum value for each frequency
     combined_curve = combined_power_law(frequencies, alpha1, C1, alpha2, C2, alpha3, C3)
     # Plot
-    plt.figure(figsize=(10, 6))
-    plt.loglog(frequencies, delta_B2_1, label=f"α={alpha1}", color='red')
-    plt.loglog(frequencies, delta_B2_2, label=f"α={alpha2}", color='green')
-    plt.loglog(frequencies, delta_B2_3, label=f"α={alpha3}", color='blue')
-    plt.loglog(frequencies, combined_curve, label="Combined", color='black', linestyle='--')
+    plot_power_law_demo(
+        frequencies=frequencies,
+        delta_B2_1=delta_B2_1,
+        delta_B2_2=delta_B2_2,
+        delta_B2_3=delta_B2_3,
+        combined_curve=combined_curve,
+        point_1=point_1,
+        point_2=point_2,
+        point_3=point_3,
+        alpha1=alpha1,
+        alpha2=alpha2,
+        alpha3=alpha3,
+    )
+
 
     # Plot the estimation points
-    plt.scatter(*point_1, color='red', s=100, marker='o')
-    plt.scatter(*point_2, color='green', s=100, marker='o')
-    plt.scatter(*point_3, color='blue', s=100, marker='o')
 
-    plt.title("Trace spectrum of magnetic field")
-    plt.xlabel("Frequency [Hz]")
-    plt.ylabel("δB^2 [nT² Hz⁻¹]")
-    plt.legend()
-    plt.grid(which='both', linestyle='--', linewidth=0.5)
-    plt.show()
 

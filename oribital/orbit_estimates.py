@@ -11,14 +11,11 @@ import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 
 # Ensure repo root is on sys.path when running this module directly.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from workflow.plotting.render_phasor_maps import _build_mesh
 
 # Matches workflow_* defaults (Europa mean radius in meters)
 EUROPA_RADIUS_M = 1.56e6
@@ -34,7 +31,7 @@ JUPITER_ROTATION_PERIOD_H = 9.925
 AMBIENT_FIELD_AMPLITUDE_T = 1e-6
 
 DEFAULT_ALTITUDE_M = 100e3
-DEFAULT_SUBDIVISIONS = 3
+DEFAULT_LMAX = 36
 
 
 @dataclass(frozen=True)
@@ -45,14 +42,12 @@ class OrbitEstimate:
     omega_rad_s: float
     speed_m_s: float
     period_s: float
-    face_spacing_m: float
-    face_transit_time_s: float
+    node_spacing_m: float
+    node_transit_time_s: float
     europa_rotation_omega_rad_s: float
     europa_rotation_angle_rad: float
-    face_angle_rad: float
-    face_drift_count: float
-    revisit_orbits: int
-    revisit_time_s: float
+    node_angle_rad: float
+    node_drift_count: float
     field_period_s: float
     phase_coverage_orbits: int
     phase_coverage_time_s: float
@@ -76,25 +71,15 @@ def circular_orbit_speed(mu_m3_s2: float, radius_m: float, altitude_m: float) ->
     return omega * r_orbit
 
 
-def _mean_face_center_spacing_m(subdivisions: int, radius_m: float) -> float:
-    _, _, centers = _build_mesh(radius_m, subdivisions=subdivisions, stride=1)
-    centers = centers.to(dtype=torch.float64)
-    count = int(centers.shape[0])
-    if count < 2:
-        return 0.0
-    sample_cap = 2000
-    if count > sample_cap:
-        idx = torch.randperm(count)[:sample_cap]
-        centers = centers[idx]
-    dists = torch.cdist(centers, centers)
-    dists.fill_diagonal_(float("inf"))
-    nn = dists.min(dim=1).values
-    return float(nn.mean().item())
+def _node_angle_width_rad(lmax: int) -> float:
+    node_count = max(1, (int(lmax) + 1) ** 2)
+    solid_angle = 4.0 * math.pi / node_count
+    return math.sqrt(solid_angle)
 
 
 def estimate_polar_orbit(
     altitude_m: float = DEFAULT_ALTITUDE_M,
-    subdivisions: int = DEFAULT_SUBDIVISIONS,
+    lmax: int = DEFAULT_LMAX,
     radius_m: float = EUROPA_RADIUS_M,
     mu_m3_s2: float = EUROPA_MU_M3_S2,
 ) -> OrbitEstimate:
@@ -103,21 +88,19 @@ def estimate_polar_orbit(
     period = 2.0 * math.pi / omega
 
     orbit_radius_m = float(radius_m + altitude_m)
-    spacing_m = _mean_face_center_spacing_m(subdivisions, orbit_radius_m)
+    node_angle = _node_angle_width_rad(lmax)
+    spacing_m = node_angle * orbit_radius_m
     transit_time_s = spacing_m / speed if speed > 0.0 else float("inf")
     rot_period_s = float(EUROPA_ROTATION_DAYS) * 86400.0
     rot_omega = 2.0 * math.pi / rot_period_s
     rot_angle = rot_omega * period
-    face_angle = spacing_m / orbit_radius_m if orbit_radius_m > 0.0 else 0.0
-    face_drift = rot_angle / face_angle if face_angle > 0.0 else 0.0
-    revisit_orbits = estimate_revisit_orbits(face_drift)
-    revisit_time = revisit_orbits * period if revisit_orbits > 0 else float("inf")
+    node_drift = rot_angle / node_angle if node_angle > 0.0 else 0.0
     field_period_s = JUPITER_ROTATION_PERIOD_H * 3600.0
     phase_orbits, phase_time, phase_gap = estimate_phase_coverage_time(
-        revisit_time, field_period_s, 0.5 * transit_time_s
+        period, field_period_s, 0.5 * transit_time_s
     )
     zero_bins, mean_bins, std_bins, zero_hours = estimate_phase_bin_stats(
-        revisit_time, field_period_s, transit_time_s, phase_time
+        period, field_period_s, transit_time_s, phase_time
     )
 
     return OrbitEstimate(
@@ -127,14 +110,12 @@ def estimate_polar_orbit(
         omega_rad_s=float(omega),
         speed_m_s=float(speed),
         period_s=float(period),
-        face_spacing_m=float(spacing_m),
-        face_transit_time_s=float(transit_time_s),
+        node_spacing_m=float(spacing_m),
+        node_transit_time_s=float(transit_time_s),
         europa_rotation_omega_rad_s=float(rot_omega),
         europa_rotation_angle_rad=float(rot_angle),
-        face_angle_rad=float(face_angle),
-        face_drift_count=float(face_drift),
-        revisit_orbits=int(revisit_orbits),
-        revisit_time_s=float(revisit_time),
+        node_angle_rad=float(node_angle),
+        node_drift_count=float(node_drift),
         field_period_s=float(field_period_s),
         phase_coverage_orbits=int(phase_orbits),
         phase_coverage_time_s=float(phase_time),
@@ -149,23 +130,12 @@ def estimate_polar_orbit(
 def estimate_default_orbit() -> OrbitEstimate:
     return estimate_polar_orbit(
         altitude_m=DEFAULT_ALTITUDE_M,
-        subdivisions=DEFAULT_SUBDIVISIONS,
+        lmax=DEFAULT_LMAX,
         radius_m=EUROPA_RADIUS_M,
         mu_m3_s2=EUROPA_MU_M3_S2,
     )
 
 
-def estimate_revisit_orbits(
-    faces_per_orbit: float, tolerance_faces: float = 0.5, max_orbits: int = 10000
-) -> int:
-    if faces_per_orbit <= 0.0:
-        return 0
-    tol = max(0.0, float(tolerance_faces))
-    for n in range(1, int(max_orbits) + 1):
-        frac = (faces_per_orbit * n) % 1.0
-        if frac <= tol:
-            return n
-    return 0
 
 
 def estimate_phase_coverage_time(
@@ -193,16 +163,18 @@ def estimate_phase_bin_stats(
     period_s: float,
     bin_width_s: float,
     coverage_time_s: float,
+    sample_times_s: np.ndarray | None = None,
 ) -> tuple[int, float, float, list[float]]:
-    if (
-        revisit_interval_s <= 0.0
-        or period_s <= 0.0
-        or bin_width_s <= 0.0
-        or coverage_time_s <= 0.0
-    ):
+    if period_s <= 0.0 or bin_width_s <= 0.0:
         return 0, 0.0, 0.0, []
-    sample_times = np.arange(0.0, coverage_time_s + 1e-9, revisit_interval_s)
-    sample_mod = np.mod(sample_times, period_s)
+    if sample_times_s is not None and len(sample_times_s) > 0:
+        sample_times = np.asarray(sample_times_s, dtype=float)
+        sample_mod = np.mod(sample_times, period_s)
+    else:
+        if revisit_interval_s <= 0.0 or coverage_time_s <= 0.0:
+            return 0, 0.0, 0.0, []
+        sample_times = np.arange(0.0, coverage_time_s + 1e-9, revisit_interval_s)
+        sample_mod = np.mod(sample_times, period_s)
     bin_count = int(math.ceil(period_s / bin_width_s))
     edges = np.linspace(0.0, period_s, bin_count + 1)
     counts, _ = np.histogram(sample_mod, bins=edges, range=(0.0, period_s))
@@ -221,39 +193,51 @@ def plot_field_revisit(
     out_path: Path,
     coverage_time_s: float | None = None,
     phase_bin_s: float | None = None,
+    sample_times_s: np.ndarray | None = None,
     show: bool = False,
 ) -> None:
     if period_s <= 0.0:
         raise ValueError("Field period must be positive.")
     t_end = 2.0 * period_s if coverage_time_s is None else float(coverage_time_s)
-    t = np.linspace(0.0, t_end, 4000)
-    y = amplitude_t * np.sin(2.0 * math.pi * t / period_s)
+
+    if sample_times_s is not None and len(sample_times_s) > 0:
+        sample_times = np.asarray(sample_times_s, dtype=float)
+        if sample_times.size:
+            t_end = float(sample_times.max())
+        t = np.linspace(0.0, t_end, 2000)
+        y = amplitude_t * np.sin(2.0 * math.pi * t / period_s)
+        sample_vals = amplitude_t * np.sin(2.0 * math.pi * sample_times / period_s)
+    elif revisit_interval_s > 0.0 and math.isfinite(revisit_interval_s):
+        sample_times = np.arange(0.0, t_end + 1e-9, revisit_interval_s)
+        t = np.linspace(0.0, t_end, 4000)
+        y = amplitude_t * np.sin(2.0 * math.pi * t / period_s)
+        sample_vals = amplitude_t * np.sin(2.0 * math.pi * sample_times / period_s)
+    else:
+        sample_times = np.array([], dtype=float)
+        sample_vals = np.array([], dtype=float)
+        t = np.linspace(0.0, t_end, 4000)
+        y = amplitude_t * np.sin(2.0 * math.pi * t / period_s)
 
     fig, (ax0, ax1, ax2) = plt.subplots(3, 1, figsize=(10, 9), sharey=False)
-
-    if revisit_interval_s > 0.0 and math.isfinite(revisit_interval_s):
-        sample_times = np.arange(0.0, t_end + 1e-9, revisit_interval_s)
-        sample_vals = amplitude_t * np.sin(2.0 * math.pi * sample_times / period_s)
+    ax0.plot(t / 3600.0, y, color="tab:blue", linestyle=":", linewidth=1.2, label="ambient")
+    if sample_times.size:
         ax0.scatter(
             sample_times / 3600.0,
             sample_vals,
             color="tab:red",
             s=9,
             zorder=3,
-            label="same face",
+            label="crossings",
         )
-    else:
-        sample_times = np.array([], dtype=float)
-        sample_vals = np.array([], dtype=float)
 
     ax0.set_xlabel("Time (hours)")
     ax0.set_ylabel("Magnetic field (T)")
-    ax0.set_title("Ambient field at same equatorial face (first crossing only)")
+    ax0.set_title("Ambient field at crossings (ground track)")
     ax0.grid(True, alpha=0.25)
     ax0.legend(loc="upper right")
 
     t_mod = np.mod(t, period_s)
-    if revisit_interval_s > 0.0 and math.isfinite(revisit_interval_s):
+    if sample_times_s is not None and len(sample_times_s) > 0:
         sample_mod = np.mod(sample_times, period_s)
         ax1.scatter(
             sample_mod / 3600.0,
@@ -261,14 +245,24 @@ def plot_field_revisit(
             color="tab:red",
             s=9,
             zorder=3,
-            label="same face",
+            label="crossings",
+        )
+    elif revisit_interval_s > 0.0 and math.isfinite(revisit_interval_s):
+        sample_mod = np.mod(sample_times, period_s)
+        ax1.scatter(
+            sample_mod / 3600.0,
+            sample_vals,
+            color="tab:red",
+            s=9,
+            zorder=3,
+            label="crossings",
         )
     else:
         sample_mod = np.array([], dtype=float)
 
     ax1.set_xlabel("Time modulo Jupiter period (hours)")
     ax1.set_ylabel("Magnetic field (T)")
-    ax1.set_title("Ambient field modulo Jupiter rotation period (first crossing only)")
+    ax1.set_title("Ambient field modulo Jupiter rotation period (crossings)")
     ax1.grid(True, alpha=0.25)
     ax1.legend(loc="upper right")
 
@@ -289,7 +283,7 @@ def plot_field_revisit(
     )
     ax2.set_xlabel("Phase bin center (hours)")
     ax2.set_ylabel("Measurement count")
-    ax2.set_title("Counts per phase bin (first crossing only)")
+    ax2.set_title("Counts per phase bin (crossings)")
     ax2.grid(True, alpha=0.25, axis="y")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -302,80 +296,161 @@ def plot_field_revisit(
 def plot_ground_track(
     orbit_omega_rad_s: float,
     rotation_omega_rad_s: float,
+    node_angle_rad: float,
     duration_s: float,
     out_path: Path,
     inclination_rad: float,
     show: bool = False,
-) -> None:
+) -> np.ndarray:
     if duration_s <= 0.0:
         raise ValueError("Duration must be positive.")
-    samples = 6000
-    t = np.linspace(0.0, duration_s, samples)
-    nu = orbit_omega_rad_s * t
-    x = np.cos(nu)
-    y = np.sin(nu) * math.cos(inclination_rad)
-    z = np.sin(nu) * math.sin(inclination_rad)
+    half_width = 0.5 * node_angle_rad
+    if half_width <= 0.0:
+        raise ValueError("Node angle must be positive.")
 
-    lon_inertial = np.arctan2(y, x)
-    lon_body = lon_inertial - rotation_omega_rad_s * t
-    lon_body = (lon_body + math.pi) % (2.0 * math.pi) - math.pi
-    lat = np.arcsin(np.clip(z, -1.0, 1.0))
+    def _wrap_delta(a: np.ndarray, b: float) -> np.ndarray:
+        return (a - b + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _compute_track(dur_s: float, n_samples: int):
+        t = np.linspace(0.0, dur_s, n_samples)
+        nu = orbit_omega_rad_s * t
+        x = np.cos(nu)
+        y = np.sin(nu) * math.cos(inclination_rad)
+        z = np.sin(nu) * math.sin(inclination_rad)
+        lon_inertial = np.arctan2(y, x)
+        lon_body = lon_inertial - rotation_omega_rad_s * t
+        lon_body = (lon_body + math.pi) % (2.0 * math.pi) - math.pi
+        lat = np.arcsin(np.clip(z, -1.0, 1.0))
+        return t, lon_body, lat
+
+    # Expand duration until we find enough crossings.
+    period = 2.0 * math.pi / orbit_omega_rad_s
+    max_duration = max(duration_s, period * 800.0)
+    cur_duration = duration_s
+    crossing_idx: list[int] = []
+    crossing_times: list[float] = []
+    t = lon_body = lat = None
+    for _ in range(6):
+        samples = max(20000, int(cur_duration / period * 2000))
+        t, lon_body, lat = _compute_track(cur_duration, samples)
+        lon0 = lon_body[0]
+        lat0 = lat[0]
+        in_box = (np.abs(_wrap_delta(lon_body, lon0)) <= half_width) & (np.abs(lat - lat0) <= half_width)
+        crossing_idx = []
+        for i in range(1, len(in_box)):
+            if in_box[i] and not in_box[i - 1]:
+                crossing_idx.append(i)
+        if in_box[0]:
+            crossing_idx = [0] + crossing_idx
+        crossing_times = [float(t[i]) for i in crossing_idx]
+        if len(crossing_idx) >= 10:
+            break
+        if cur_duration >= max_duration:
+            break
+        cur_duration = min(cur_duration * 2.0, max_duration)
+
+    if len(crossing_idx) < 2 or t is None or lon_body is None or lat is None:
+        raise RuntimeError("Did not find enough node crossings within the sampled duration.")
+
+    # Limit to first 10 crossings.
+    crossing_idx = crossing_idx[:10]
+    crossing_times = crossing_times[:10]
+    first_idx = crossing_idx[0]
+    last_idx = crossing_idx[-1]
+
+    lon_seg = lon_body[first_idx:last_idx + 1]
+    lat_seg = lat[first_idx:last_idx + 1]
+    track_hours = float(t[last_idx] - t[first_idx]) / 3600.0
+    if len(crossing_times) >= 2:
+        avg_dt = float(np.mean(np.diff(crossing_times)))
+        print(f"Average crossing interval: {avg_dt/3600.0:.3f} hours ({avg_dt:.1f} s)")
 
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(np.degrees(lon_body), np.degrees(lat), color="tab:green", linewidth=1.0)
+    ax.plot(np.degrees(lon_seg), np.degrees(lat_seg), color="tab:green", linewidth=1.0)
+    ax.scatter(
+        np.degrees(lon_body[crossing_idx]),
+        np.degrees(lat[crossing_idx]),
+        color="tab:red",
+        s=18,
+        zorder=3,
+        label="crossings",
+    )
+
+    # Draw node area (approx square of width node_angle_rad centered at first visit).
+    lon_c = lon0
+    lat_c = lat0
+    width_deg = math.degrees(node_angle_rad)
+    half_deg = 0.5 * width_deg
+    rect = plt.Rectangle(
+        (math.degrees(lon_c) - half_deg, math.degrees(lat_c) - half_deg),
+        width_deg,
+        width_deg,
+        fill=False,
+        edgecolor="tab:orange",
+        linewidth=1.5,
+    )
+    ax.add_patch(rect)
     ax.set_xlim(-180, 180)
     ax.set_ylim(-90, 90)
     ax.set_xlabel("Longitude (deg)")
     ax.set_ylabel("Latitude (deg)")
     inc_deg = math.degrees(inclination_rad)
-    ax.set_title(f"Ground track (equirectangular projection, inc={inc_deg:.1f} deg)")
+    ax.set_title(
+        f"Ground track (first 10 crossings, {track_hours:.2f} hr, inc={inc_deg:.1f} deg)"
+    )
     ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper right")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     if show:
         plt.show()
     plt.close(fig)
+    return np.asarray(crossing_times, dtype=float)
 
 
 if __name__ == "__main__":
     est = estimate_default_orbit()
+    track_duration = est.period_s * 200.0
+    crossing_times = plot_ground_track(
+        est.omega_rad_s,
+        est.europa_rotation_omega_rad_s,
+        est.node_angle_rad,
+        track_duration,
+        Path("figures/oribital_ground_track.png"),
+        inclination_rad=math.radians(80.0),
+        show=True,
+    )
     plot_field_revisit(
-        est.revisit_time_s,
+        est.period_s,
         est.field_period_s,
         AMBIENT_FIELD_AMPLITUDE_T,
         Path("figures/oribital_field_revisit.png"),
         coverage_time_s=est.phase_coverage_time_s,
-        phase_bin_s=est.face_transit_time_s,
-        show=True,
-    )
-    plot_ground_track(
-        est.omega_rad_s,
-        est.europa_rotation_omega_rad_s,
-        est.period_s * 50.0,
-        Path("figures/oribital_ground_track.png"),
-        inclination_rad=math.radians(80.0),
+        phase_bin_s=est.node_transit_time_s,
+        sample_times_s=crossing_times,
         show=True,
     )
     print("Europa polar circular orbit (100 km altitude)")
     print(f"omega = {est.omega_rad_s:.6e} rad/s")
     print(f"speed = {est.speed_m_s:.3f} m/s")
     print(f"period = {est.period_s/3600.0:.3f} hours")
-    print(f"mesh mean spacing = {est.face_spacing_m/1000.0:.3f} km")
-    print(f"face transit time = {est.face_transit_time_s:.3f} s")
+    print(f"node mean spacing = {est.node_spacing_m/1000.0:.3f} km")
+    print(f"node transit time = {est.node_transit_time_s:.3f} s")
     print(f"Europa rotation omega = {est.europa_rotation_omega_rad_s:.6e} rad/s")
     print(f"Europa rotation during orbit = {est.europa_rotation_angle_rad:.6e} rad")
-    print(f"face angle (equator) = {est.face_angle_rad:.6e} rad")
-    print(f"face drift per orbit = {est.face_drift_count:.3f} faces")
-    print(f"revisit within 0.5 face = {est.revisit_orbits} orbits")
-    print(f"revisit time = {est.revisit_time_s/3600.0:.3f} hours")
+    print(f"node angle (equator) = {est.node_angle_rad:.6e} rad")
+    print(f"node drift per orbit = {est.node_drift_count:.3f} nodes")
     print(f"field period (Jupiter rotation) = {est.field_period_s/3600.0:.3f} hours")
+    zero_bins, mean_bins, std_bins, zero_hours = estimate_phase_bin_stats(
+        est.period_s,
+        est.field_period_s,
+        est.node_transit_time_s,
+        est.phase_coverage_time_s,
+        sample_times_s=crossing_times,
+    )
     print(f"phase coverage gap = {est.phase_coverage_gap_s:.3f} s")
     print(f"phase coverage time = {est.phase_coverage_time_s/3600.0:.3f} hours")
     print(f"phase coverage orbits = {est.phase_coverage_orbits}")
-    print(f"phase bins with zero = {est.phase_bin_zero_count}")
-    print(f"phase bin mean = {est.phase_bin_mean:.3f}")
-    print(f"phase bin std = {est.phase_bin_std:.3f}")
-    if est.phase_bin_zero_hours:
-        print("phase bins with zero (hours): " + ", ".join(f"{h:.3f}" for h in est.phase_bin_zero_hours))
-    print("Note: counts/plots use only the first equator crossing each orbit; continuous sampling would roughly double counts.")
+    print(f"phase bin mean = {mean_bins:.3f}")
+    print(f"phase bin std = {std_bins:.3f}")
