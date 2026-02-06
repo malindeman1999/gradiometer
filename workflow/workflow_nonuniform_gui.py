@@ -94,6 +94,9 @@ def _load_log_into_widget(text_widget: tk.Text) -> None:
 
 def _rename_run_prefix(new_prefix: str, log) -> None:
     run_dir = STATE_DIR
+    if not run_dir.exists():
+        log("Rename prefix skipped: run folder does not exist yet.")
+        return
     name = run_dir.name
     parts = name.split("_")
     stamp = parts[-1] if len(parts) >= 2 and len(parts[-1]) == 6 else _timestamp()
@@ -102,8 +105,13 @@ def _rename_run_prefix(new_prefix: str, log) -> None:
     clean = (new_prefix or "run").strip() or "run"
     target = run_dir.parent / f"{clean}_{stamp}"
     if target == run_dir:
+        log("Rename prefix skipped: new prefix matches current folder.")
         return
-    run_dir.rename(target)
+    try:
+        run_dir.rename(target)
+    except Exception as exc:  # noqa: BLE001
+        log(f"Rename prefix failed: {exc}")
+        return
     _set_run_dirs(target)
     log(f"Renamed run folder to {target}")
 
@@ -272,6 +280,7 @@ def step1_build_grid_admittance(
         f"min={min_val:.3e}, max={max_val:.3e}"
     )
     omega = 2.0 * math.pi / (9.925 * 3600.0)
+    log(f"Inductance scale: {float(inductance_scale):.3f}")
     cond = _complex_sheet_admittance(cond_real, omega, grid_cfg.radius_m, inductance_scale=inductance_scale)
     Y_s = sh_forward(cond, positions, lmax=grid_cfg.lmax, weights=weights)
     sigma_proj = sh_forward(cond_real.to(torch.float64), positions, lmax=grid_cfg.lmax, weights=weights)
@@ -1055,6 +1064,7 @@ def main():
             _log(log_widget, "Step 0: refreshed GUI inputs from loaded state.")
         except Exception as exc:  # noqa: BLE001
             _log(log_widget, f"Step 0: unable to refresh GUI inputs ({exc})")
+    _refresh_inputs_from_loaded_state()
 
     # Step 1b
     ttk.Label(frm, text="Step 1b: Admittance check").grid(row=4, column=0, sticky="w")
