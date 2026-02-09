@@ -1,6 +1,6 @@
 """
 GUI for running the non-uniform demo pipeline in four stages:
-1) Build grid + admittance (single-mode conductivity)
+1) Build grid + admittance (selectable conductivity model)
 2) Build ambient field
 3) Solve currents (self-consistent by default, or first-order)
 4) Render overview and gradient plots
@@ -34,6 +34,7 @@ from workflow.plotting.render_demo_overview import render_demo_overview
 from workflow.plotting.sphere_roundtrip import build_roundtrip_grid, sphere_image
 from gaunt.assemble_gaunt_checkpoints import assemble_in_memory
 from workflow.data_objects.phasor_data import PhasorSimulation
+from workflow.conductivity_models import EuropaSnapshotConfig, build_europa_snapshot_conductivity
 
 BASE_RUN_DIR = Path("workflow/artifacts/nonuniform_workflow")
 STATE_DIR = BASE_RUN_DIR
@@ -185,6 +186,51 @@ def _synthesize_sigma_field(
     return sigma, sigma_coeffs
 
 
+def _project_and_verify_real_field_roundtrip(
+    field_real: torch.Tensor,
+    positions: torch.Tensor,
+    weights: torch.Tensor,
+    lmax: int,
+    log,
+    *,
+    label: str,
+    rel_l2_tol: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    """Project real grid field to SH and verify inverse round-trip fidelity."""
+    field = field_real.to(torch.float64)
+    coeffs = sh_forward(field, positions, lmax=lmax, weights=weights)
+    recon = sh_inverse(coeffs, positions, weights)
+    imag_max = float(recon.imag.abs().max().item())
+    recon_real = recon.real
+
+    w = weights.to(torch.float64)
+    wsum = float(w.sum().item())
+    diff = recon_real - field
+    num = float(torch.sum(w * diff * diff).item())
+    den = float(torch.sum(w * field * field).item())
+    rel_l2 = math.sqrt(num / max(den, 1e-30))
+    max_abs = float(torch.max(torch.abs(diff)).item())
+    ref_max = float(torch.max(torch.abs(field)).item())
+    rel_max = max_abs / max(ref_max, 1e-30)
+
+    stats = {
+        "rel_l2": rel_l2,
+        "rel_max": rel_max,
+        "imag_max": imag_max,
+        "weight_sum": wsum,
+    }
+    log(
+        f"{label} round-trip: rel_l2={rel_l2:.3e}, rel_max={rel_max:.3e}, "
+        f"max|imag(recon)|={imag_max:.3e}"
+    )
+    if rel_l2 > float(rel_l2_tol):
+        raise RuntimeError(
+            f"{label} SH round-trip rel_l2={rel_l2:.3e} exceeds tolerance {float(rel_l2_tol):.3e}. "
+            "Increase lmax or smooth/broaden spatial structure."
+        )
+    return coeffs, recon_real, stats
+
+
 def _node_count_from_lmax(lmax: int) -> int:
     return max(1, (int(lmax) + 1) ** 2)
 
@@ -231,6 +277,7 @@ def step1_build_grid_admittance(
     frac_rms: float,
     mode_l: int,
     mode_m: int,
+    conductivity_model: str,
     inductance_scale: float,
     log,
 ) -> Path:
@@ -244,16 +291,34 @@ def step1_build_grid_admittance(
     frac_rms = max(0.0, float(frac_rms))
     mode_l = int(mode_l)
     mode_m = int(mode_m)
-    cond_real, sigma_coeffs = _synthesize_sigma_field(
-        positions,
-        weights,
-        grid_cfg.lmax,
-        mean_val,
-        frac_rms,
-        mode_l,
-        mode_m,
-        log,
-    )
+    model_key = str(conductivity_model or "europa_snapshot").strip().lower()
+    if model_key not in {"synthetic_sh", "europa_snapshot"}:
+        raise RuntimeError(f"Unknown conductivity_model: {conductivity_model}")
+    log(f"Conductivity model: {model_key}")
+
+    sigma_coeffs_target = None
+    model_components: dict[str, torch.Tensor | float | int] = {}
+    if model_key == "synthetic_sh":
+        cond_real, sigma_coeffs_target = _synthesize_sigma_field(
+            positions,
+            weights,
+            grid_cfg.lmax,
+            mean_val,
+            frac_rms,
+            mode_l,
+            mode_m,
+            log,
+        )
+        roundtrip_tol = 5e-6
+    else:
+        cfg = EuropaSnapshotConfig(seed=7)
+        cond_real, model_components = build_europa_snapshot_conductivity(
+            positions=positions,
+            weights=weights,
+            sigma0=mean_val,
+            cfg=cfg,
+        )
+        roundtrip_tol = 3e-2
     realized_mean = float(cond_real.mean().item())
     realized_rms = float(torch.sqrt(((cond_real - realized_mean) ** 2).mean()).item())
     target_rms = mean_val * frac_rms
@@ -267,23 +332,33 @@ def step1_build_grid_admittance(
 
     mean_rel_err = _relative_error(realized_mean, mean_val)
     rms_rel_err = _relative_error(realized_rms, target_rms)
-    if mean_rel_err > 0.10 or rms_rel_err > 0.10:
-        raise RuntimeError(
-            "Conductivity synthesis missed requested statistics by more than 10%: "
-            f"mean target={mean_val:.6e}, realized={realized_mean:.6e}, rel_err={mean_rel_err:.2%}; "
-            f"rms target={target_rms:.6e}, realized={realized_rms:.6e}, rel_err={rms_rel_err:.2%}."
-        )
+    if model_key == "synthetic_sh":
+        if mean_rel_err > 0.10 or rms_rel_err > 0.10:
+            raise RuntimeError(
+                "Conductivity synthesis missed requested statistics by more than 10%: "
+                f"mean target={mean_val:.6e}, realized={realized_mean:.6e}, rel_err={mean_rel_err:.2%}; "
+                f"rms target={target_rms:.6e}, realized={realized_rms:.6e}, rel_err={rms_rel_err:.2%}."
+            )
 
     log(
         f"Sigma_s stats: mean={realized_mean:.3e}, rms={realized_rms:.3e} "
         f"(frac={realized_rms/mean_val if mean_val > 0 else 0.0:.2%}), "
         f"min={min_val:.3e}, max={max_val:.3e}"
     )
+    sigma_proj, sigma_recon, sigma_rt = _project_and_verify_real_field_roundtrip(
+        cond_real,
+        positions,
+        weights,
+        grid_cfg.lmax,
+        log,
+        label="conductivity",
+        rel_l2_tol=roundtrip_tol,
+    )
+
     omega = 2.0 * math.pi / (9.925 * 3600.0)
     log(f"Inductance scale: {float(inductance_scale):.3f}")
     cond = _complex_sheet_admittance(cond_real, omega, grid_cfg.radius_m, inductance_scale=inductance_scale)
     Y_s = sh_forward(cond, positions, lmax=grid_cfg.lmax, weights=weights)
-    sigma_proj = sh_forward(cond_real.to(torch.float64), positions, lmax=grid_cfg.lmax, weights=weights)
 
     state = {
         "grid_cfg": grid_cfg,
@@ -297,14 +372,21 @@ def step1_build_grid_admittance(
         "admittance_spectral": Y_s,
         "admittance_grid": cond,
         "sigma_spectral": sigma_proj,
-        "sigma_spectral_target": sigma_coeffs,
+        "sigma_spectral_target": sigma_coeffs_target,
+        "sigma_roundtrip_recon_grid": sigma_recon,
+        "sigma_roundtrip_rel_l2": float(sigma_rt["rel_l2"]),
+        "sigma_roundtrip_rel_max": float(sigma_rt["rel_max"]),
+        "sigma_roundtrip_imag_max": float(sigma_rt["imag_max"]),
         "sigma_grid": cond_real,
+        "conductivity_model": model_key,
         "sigma_mean": mean_val,
         "sigma_frac_rms": frac_rms,
         "sigma_mode_l": int(mode_l),
         "sigma_mode_m": int(mode_m),
         "inductance_scale": float(inductance_scale),
     }
+    if model_components:
+        state.update(model_components)
     path = _save_state("grid_admittance.pt", state)
     log(
         f"Step 1 complete (lmax={lmax}, nodes={grid['n_points']}, faces={grid['n_faces']}). "
@@ -354,13 +436,20 @@ def step1b_plot_admittance_power(log) -> None:
     sigma_coeffs = state.get("sigma_spectral")
     if coeffs is None or sigma_coeffs is None:
         raise RuntimeError("Missing admittance_spectral or sigma_spectral. Run Step 1 before plotting magnitudes.")
-    mode_l = state.get("sigma_mode_l", None)
-    mode_m = state.get("sigma_mode_m", None)
-    frac_rms = state.get("sigma_frac_rms", None)
-    mode_l_str = f"{int(mode_l)}" if mode_l is not None else "?"
-    mode_m_str = f"{int(mode_m)}" if mode_m is not None else "?"
-    frac_rms_str = f"{float(frac_rms):.2%}" if frac_rms is not None else "?"
-    title_suffix = f"(l={mode_l_str}, m=±{mode_m_str}, frac RMS {frac_rms_str})"
+    model_key = str(state.get("conductivity_model", "synthetic_sh"))
+    if model_key == "synthetic_sh":
+        mode_l = state.get("sigma_mode_l", None)
+        mode_m = state.get("sigma_mode_m", None)
+        frac_rms = state.get("sigma_frac_rms", None)
+        mode_l_str = f"{int(mode_l)}" if mode_l is not None else "?"
+        mode_m_str = f"{int(mode_m)}" if mode_m is not None else "?"
+        frac_rms_str = f"{float(frac_rms):.2%}" if frac_rms is not None else "?"
+        title_suffix = f"(model=synthetic_sh, l={mode_l_str}, m=+/-{mode_m_str}, frac RMS {frac_rms_str})"
+    else:
+        n_sites = int(state.get("snapshot_n_exchange_sites", 0))
+        seed = int(state.get("snapshot_seed", -1))
+        width = float(state.get("snapshot_exchange_width_deg", 0.0))
+        title_suffix = f"(model=europa_snapshot, sites={n_sites}, width={width:.1f} deg, seed={seed})"
 
     l_b, m_b, mag = _flatten_harmonics(coeffs.to(torch.complex128))
     _, _, mag_sigma = _flatten_harmonics(sigma_coeffs.to(torch.complex128))
@@ -848,6 +937,23 @@ def main():
         "solution_latest": "solution_latest.pt",
         "overview_input": "overview_input.pt",
     }
+    solve_mode_var = tk.StringVar(value="self_consistent")
+    mode_labels = {
+        "first_order": "first-order",
+        "self_consistent": "self-consistent",
+        "iterative": "iterative",
+    }
+    mode_accents = {
+        "first_order": "light sky blue",
+        "self_consistent": "pale green",
+        "iterative": "khaki1",
+    }
+
+    def _selected_mode() -> str:
+        mode = solve_mode_var.get()
+        if mode not in mode_labels:
+            return "self_consistent"
+        return mode
 
     def _standard_state_path(state_key: str) -> Path:
         if state_key not in state_files:
@@ -880,9 +986,15 @@ def main():
         log(f"Step 0 save: copied {src} -> {dst}")
         return dst
 
-    def _set_button_state(btn: tk.Button, enabled: bool, completed: bool = False) -> None:
+    def _set_button_state(
+        btn: tk.Button, enabled: bool, completed: bool = False, color: str | None = None
+    ) -> None:
         if enabled:
-            btn.config(state=tk.NORMAL, bg="pale green" if completed else "SystemButtonFace")
+            if color is not None:
+                bg = color
+            else:
+                bg = "pale green" if completed else "SystemButtonFace"
+            btn.config(state=tk.NORMAL, bg=bg)
         else:
             btn.config(state=tk.DISABLED, bg="light gray")
 
@@ -903,25 +1015,22 @@ def main():
         first_ok = _solution_exists("first_order")
         self_ok = _solution_exists("self_consistent")
         iter_ok = _solution_exists("iterative")
+        selected_mode = _selected_mode()
+        selected_ok = {
+            "first_order": first_ok,
+            "self_consistent": self_ok,
+            "iterative": iter_ok,
+        }[selected_mode]
+        selected_color = mode_accents[selected_mode]
         _set_button_state(btn_step1, True, completed=grid_ok)
         _set_button_state(btn_step1b, grid_ok, completed=grid_ok)
         _set_button_state(btn_step1b_power, grid_ok, completed=grid_ok)
         _set_button_state(btn_step2, grid_ok, completed=ambient_ok)
-        _set_button_state(btn_step4_first, ambient_ok, completed=first_ok)
-        _set_button_state(btn_step5_self, ambient_ok, completed=self_ok)
-        _set_button_state(btn_step6_iter, ambient_ok, completed=iter_ok)
-        _set_button_state(btn_overview_first, first_ok)
-        _set_button_state(btn_grad0_first, first_ok)
-        _set_button_state(btn_grad100_first, first_ok)
-        _set_button_state(btn_harm_first, first_ok)
-        _set_button_state(btn_overview_self, self_ok)
-        _set_button_state(btn_grad0_self, self_ok)
-        _set_button_state(btn_grad100_self, self_ok)
-        _set_button_state(btn_harm_self, self_ok)
-        _set_button_state(btn_overview_iter, iter_ok)
-        _set_button_state(btn_grad0_iter, iter_ok)
-        _set_button_state(btn_grad100_iter, iter_ok)
-        _set_button_state(btn_harm_iter, iter_ok)
+        _set_button_state(btn_step_solve, ambient_ok, completed=selected_ok, color=selected_color if ambient_ok else None)
+        _set_button_state(btn_overview, selected_ok, color=selected_color if selected_ok else None)
+        _set_button_state(btn_grad0, selected_ok, color=selected_color if selected_ok else None)
+        _set_button_state(btn_grad100, selected_ok, color=selected_color if selected_ok else None)
+        _set_button_state(btn_harm, selected_ok, color=selected_color if selected_ok else None)
 
     # Step 0: load latest run folder
     ttk.Label(frm, text="Step 0: Run folder").grid(row=0, column=0, sticky="w")
@@ -996,6 +1105,15 @@ def main():
     tk.Radiobutton(frm, text="PyVista", variable=plotter_var, value="pyvista").grid(row=2, column=8, sticky="w")
     tk.Radiobutton(frm, text="Matplotlib", variable=plotter_var, value="matplotlib").grid(row=2, column=9, sticky="w")
 
+    ttk.Label(frm, text="conductivity model").grid(row=4, column=0, sticky="w")
+    conductivity_model_var = tk.StringVar(value="europa_snapshot")
+    tk.Radiobutton(
+        frm, text="Europa snapshot", variable=conductivity_model_var, value="europa_snapshot"
+    ).grid(row=4, column=1, sticky="w")
+    tk.Radiobutton(
+        frm, text="Existing synthetic", variable=conductivity_model_var, value="synthetic_sh"
+    ).grid(row=4, column=2, sticky="w")
+
     default_cfg = GridConfig(nside=1, lmax=1, radius_m=1.56e6, device="cpu")
     default_mean = 2.0 * default_cfg.seawater_conductivity_s_per_m * default_cfg.ocean_thickness_m
     ttk.Label(frm, text="mean conductivity (S)").grid(row=3, column=1, sticky="e")
@@ -1010,7 +1128,7 @@ def main():
     ttk.Label(frm, text="frac RMS").grid(row=3, column=7, sticky="e")
     frac_rms_var = tk.StringVar(value="0.05")
     ttk.Entry(frm, textvariable=frac_rms_var, width=6).grid(row=3, column=8, sticky="w")
-    ttk.Label(frm, text="inductance scale (x)").grid(row=3, column=9, sticky="e")
+    ttk.Label(frm, text="extra inducance scale (x)").grid(row=3, column=9, sticky="e")
     inductance_scale_var = tk.StringVar(value="0.0")
     ttk.Entry(frm, textvariable=inductance_scale_var, width=6).grid(row=3, column=10, sticky="w")
 
@@ -1027,6 +1145,7 @@ def main():
                     float(frac_rms_var.get()),
                     int(mode_l_var.get()),
                     int(mode_m_var.get()),
+                    conductivity_model_var.get(),
                     float(inductance_scale_var.get()),
                     lambda msg: _log(log_widget, msg),
                 ),
@@ -1061,19 +1180,21 @@ def main():
                 mode_m_var.set(str(int(state["sigma_mode_m"])))
             if "inductance_scale" in state:
                 inductance_scale_var.set(str(float(state["inductance_scale"])))
+            if "conductivity_model" in state:
+                conductivity_model_var.set(str(state["conductivity_model"]))
             _log(log_widget, "Step 0: refreshed GUI inputs from loaded state.")
         except Exception as exc:  # noqa: BLE001
             _log(log_widget, f"Step 0: unable to refresh GUI inputs ({exc})")
     _refresh_inputs_from_loaded_state()
 
     # Step 1b
-    ttk.Label(frm, text="Step 1b: Admittance check").grid(row=4, column=0, sticky="w")
+    ttk.Label(frm, text="Step 1b: Admittance check").grid(row=5, column=0, sticky="w")
     btn_step1b = tk.Button(
         frm,
         text="Admittance plots",
         command=lambda: run_step_ui(btn_step1b, lambda: step1b_plot_roundtrip(lambda msg: _log(log_widget, msg), plotter_var.get())),
     )
-    btn_step1b.grid(row=4, column=2, padx=6, sticky="w")
+    btn_step1b.grid(row=5, column=2, padx=6, sticky="w")
     btn_step1b_power = tk.Button(
         frm,
         text="Admittance magnitude (l,m)",
@@ -1082,184 +1203,112 @@ def main():
             lambda: step1b_plot_admittance_power(lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_step1b_power.grid(row=4, column=3, padx=6, sticky="w")
+    btn_step1b_power.grid(row=5, column=3, padx=6, sticky="w")
 
     # Step 2
-    ttk.Label(frm, text="Step 2: Ambient field").grid(row=5, column=0, sticky="w")
+    ttk.Label(frm, text="Step 2: Ambient field").grid(row=6, column=0, sticky="w")
     btn_step2 = tk.Button(
         frm,
         text="Build ambient",
         command=lambda: run_step(btn_step2, lambda: step2_build_ambient(lambda msg: _log(log_widget, msg))),
     )
-    btn_step2.grid(row=5, column=2, padx=6, sticky="w")
+    btn_step2.grid(row=6, column=2, padx=6, sticky="w")
 
-    # Step 4: First-order solve + plots
-    ttk.Label(frm, text="Step 4: First-order solve").grid(row=6, column=0, sticky="w")
-    btn_step4_first = tk.Button(
+    # Step 4-6: Solve mode selector + shared plots
+    solve_mode_header_var = tk.StringVar(value="Step 4-6: Solve mode")
+    ttk.Label(frm, textvariable=solve_mode_header_var).grid(row=7, column=0, sticky="w")
+    tk.Radiobutton(
         frm,
-        text="Solve first-order",
-        command=lambda: run_step(
-            btn_step4_first,
-            lambda: step3_solve_currents(True, lambda msg: _log(log_widget, msg)),
-        ),
-    )
-    btn_step4_first.grid(row=6, column=2, padx=4, sticky="w")
-    btn_overview_first = tk.Button(
+        text="First-order",
+        variable=solve_mode_var,
+        value="first_order",
+        selectcolor=mode_accents["first_order"],
+    ).grid(row=7, column=1, sticky="w")
+    tk.Radiobutton(
         frm,
-        text="Overview (first-order)",
-        wraplength=180,
-        justify="left",
-        command=lambda: run_step_ui(
-            btn_overview_first,
-            lambda: step4_render_overview("first_order", lambda msg: _log(log_widget, msg), plotter_var.get()),
-        ),
-    )
-    btn_overview_first.grid(row=6, column=3, padx=4, sticky="w")
-    btn_grad0_first = tk.Button(
+        text="Self-consistent",
+        variable=solve_mode_var,
+        value="self_consistent",
+        selectcolor=mode_accents["self_consistent"],
+    ).grid(row=7, column=2, sticky="w")
+    tk.Radiobutton(
         frm,
-        text="Gradients @ surface (first-order)",
-        wraplength=180,
-        justify="left",
-        command=lambda: run_step_ui(
-            btn_grad0_first,
-            lambda: step4_render_gradient("first_order", 0.0, lambda msg: _log(log_widget, msg), plotter_var.get()),
-        ),
-    )
-    btn_grad0_first.grid(row=6, column=4, padx=4, sticky="w")
-    btn_grad100_first = tk.Button(
-        frm,
-        text="Gradients @ 100 km (first-order)",
-        wraplength=180,
-        justify="left",
-        command=lambda: run_step_ui(
-            btn_grad100_first,
-            lambda: step4_render_gradient("first_order", 100e3, lambda msg: _log(log_widget, msg), plotter_var.get()),
-        ),
-    )
-    btn_grad100_first.grid(row=6, column=5, padx=4, sticky="w")
-    btn_harm_first = tk.Button(
-        frm,
-        text="Harmonics (ambient vs emitted)",
-        wraplength=180,
-        justify="left",
-        command=lambda: run_step_ui(
-            btn_harm_first,
-            lambda: step4_plot_harmonics("first_order", lambda msg: _log(log_widget, msg)),
-        ),
-    )
-    btn_harm_first.grid(row=6, column=6, padx=4, sticky="w")
+        text="Iterative",
+        variable=solve_mode_var,
+        value="iterative",
+        selectcolor=mode_accents["iterative"],
+    ).grid(row=7, column=3, sticky="w")
 
-    # Step 5: Self-consistent solve + plots
-    ttk.Label(frm, text="Step 5: Self-consistent solve").grid(row=7, column=0, sticky="w")
-    btn_step5_self = tk.Button(
+    def _run_selected_solve():
+        mode = _selected_mode()
+        if mode == "first_order":
+            return step3_solve_currents(True, lambda msg: _log(log_widget, msg))
+        if mode == "iterative":
+            return step6_iterative_solve(int(iter_order_var.get()), lambda msg: _log(log_widget, msg))
+        return step3_solve_currents(False, lambda msg: _log(log_widget, msg))
+
+    btn_step_solve = tk.Button(
         frm,
         text="Solve self-consistent",
-        command=lambda: run_step(
-            btn_step5_self,
-            lambda: step3_solve_currents(False, lambda msg: _log(log_widget, msg)),
-        ),
+        command=lambda: run_step(btn_step_solve, _run_selected_solve),
     )
-    btn_step5_self.grid(row=7, column=2, padx=4, sticky="w")
-    btn_overview_self = tk.Button(
+    btn_step_solve.grid(row=8, column=2, padx=4, sticky="w")
+    btn_overview = tk.Button(
         frm,
         text="Overview (self-consistent)",
         wraplength=180,
         justify="left",
         command=lambda: run_step_ui(
-            btn_overview_self,
-            lambda: step4_render_overview("self_consistent", lambda msg: _log(log_widget, msg), plotter_var.get()),
+            btn_overview,
+            lambda: step4_render_overview(_selected_mode(), lambda msg: _log(log_widget, msg), plotter_var.get()),
         ),
     )
-    btn_overview_self.grid(row=7, column=3, padx=4, sticky="w")
-    btn_grad0_self = tk.Button(
+    btn_overview.grid(row=8, column=3, padx=4, sticky="w")
+    btn_grad0 = tk.Button(
         frm,
         text="Gradients @ surface (self-consistent)",
         wraplength=180,
         justify="left",
         command=lambda: run_step_ui(
-            btn_grad0_self,
-            lambda: step4_render_gradient("self_consistent", 0.0, lambda msg: _log(log_widget, msg), plotter_var.get()),
+            btn_grad0,
+            lambda: step4_render_gradient(_selected_mode(), 0.0, lambda msg: _log(log_widget, msg), plotter_var.get()),
         ),
     )
-    btn_grad0_self.grid(row=7, column=4, padx=4, sticky="w")
-    btn_grad100_self = tk.Button(
+    btn_grad0.grid(row=8, column=4, padx=4, sticky="w")
+    btn_grad100 = tk.Button(
         frm,
         text="Gradients @ 100 km (self-consistent)",
         wraplength=180,
         justify="left",
         command=lambda: run_step_ui(
-            btn_grad100_self,
-            lambda: step4_render_gradient("self_consistent", 100e3, lambda msg: _log(log_widget, msg), plotter_var.get()),
+            btn_grad100,
+            lambda: step4_render_gradient(_selected_mode(), 100e3, lambda msg: _log(log_widget, msg), plotter_var.get()),
         ),
     )
-    btn_grad100_self.grid(row=7, column=5, padx=4, sticky="w")
-    btn_harm_self = tk.Button(
+    btn_grad100.grid(row=8, column=5, padx=4, sticky="w")
+    btn_harm = tk.Button(
         frm,
         text="Harmonics (ambient vs emitted)",
         wraplength=180,
         justify="left",
         command=lambda: run_step_ui(
-            btn_harm_self,
-            lambda: step4_plot_harmonics("self_consistent", lambda msg: _log(log_widget, msg)),
+            btn_harm,
+            lambda: step4_plot_harmonics(_selected_mode(), lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_harm_self.grid(row=7, column=6, padx=4, sticky="w")
+    btn_harm.grid(row=8, column=6, padx=4, sticky="w")
 
-    # Step 6: Iterative series solve + plots
-    ttk.Label(frm, text="Step 6: Iterative solve").grid(row=8, column=0, sticky="w")
-    btn_step6_iter = tk.Button(
-        frm,
-        text="Solve iterative",
-        command=lambda: run_step(
-            btn_step6_iter,
-            lambda: step6_iterative_solve(int(iter_order_var.get()), lambda msg: _log(log_widget, msg)),
-        ),
-    )
-    btn_step6_iter.grid(row=8, column=2, padx=4, sticky="w")
-    btn_overview_iter = tk.Button(
-        frm,
-        text="Overview (iterative)",
-        wraplength=180,
-        justify="left",
-        command=lambda: run_step_ui(
-            btn_overview_iter,
-            lambda: step4_render_overview("iterative", lambda msg: _log(log_widget, msg), plotter_var.get()),
-        ),
-    )
-    btn_overview_iter.grid(row=8, column=3, padx=4, sticky="w")
-    btn_grad0_iter = tk.Button(
-        frm,
-        text="Gradients @ surface (iterative)",
-        wraplength=180,
-        justify="left",
-        command=lambda: run_step_ui(
-            btn_grad0_iter,
-            lambda: step4_render_gradient("iterative", 0.0, lambda msg: _log(log_widget, msg), plotter_var.get()),
-        ),
-    )
-    btn_grad0_iter.grid(row=8, column=4, padx=4, sticky="w")
-    btn_grad100_iter = tk.Button(
-        frm,
-        text="Gradients @ 100 km (iterative)",
-        wraplength=180,
-        justify="left",
-        command=lambda: run_step_ui(
-            btn_grad100_iter,
-            lambda: step4_render_gradient("iterative", 100e3, lambda msg: _log(log_widget, msg), plotter_var.get()),
-        ),
-    )
-    btn_grad100_iter.grid(row=8, column=5, padx=4, sticky="w")
-    btn_harm_iter = tk.Button(
-        frm,
-        text="Harmonics (ambient vs emitted)",
-        wraplength=180,
-        justify="left",
-        command=lambda: run_step_ui(
-            btn_harm_iter,
-            lambda: step4_plot_harmonics("iterative", lambda msg: _log(log_widget, msg)),
-        ),
-    )
-    btn_harm_iter.grid(row=8, column=6, padx=4, sticky="w")
+    def _update_selected_mode_labels() -> None:
+        mode = _selected_mode()
+        label = mode_labels[mode]
+        solve_mode_header_var.set(f"Step 4-6: {label} solve")
+        btn_step_solve.config(text=f"Solve {label}")
+        btn_overview.config(text=f"Overview ({label})")
+        btn_grad0.config(text=f"Gradients @ surface ({label})")
+        btn_grad100.config(text=f"Gradients @ 100 km ({label})")
+
+    solve_mode_var.trace_add("write", lambda *_: (_update_selected_mode_labels(), _update_button_states()))
+    _update_selected_mode_labels()
 
     frm.rowconfigure(11, weight=1)
     frm.columnconfigure(6, weight=1)
