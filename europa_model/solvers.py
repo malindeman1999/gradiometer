@@ -10,6 +10,7 @@ Variants:
 Outputs: toroidal E, toroidal/poloidal currents, and emitted B field phasors.
 All inputs/outputs use spherical-harmonic layout [lmax+1, 2*lmax+1] with m index = m+lmax.
 """
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
@@ -85,27 +86,6 @@ def _gaunt_coeff(L: int, M: int, l0: int, m0: int, l: int, m: int) -> float:
     w2 = wigner_3j(L, l0, l, -M, m0, m)
     # (-1)^M appears because the bra carries a complex conjugate.
     return float(((-1.0) ** M) * pref * w1 * w2)
-
-
-def _build_gaunt_tensor(lmax: int) -> np.ndarray:
-    """Precompute Gaunt coefficients G[L,M,l0,m0,l,m] = <Y_{L,M} | Y_{l0,m0} Y_{l,m}>."""
-    G = np.zeros(
-        (lmax + 1, 2 * lmax + 1, lmax + 1, 2 * lmax + 1, lmax + 1, 2 * lmax + 1),
-        dtype=np.float64,
-    )
-    for L in range(lmax + 1):
-        for M in range(-L, L + 1):
-            for l0 in range(lmax + 1):
-                for m0 in range(-l0, l0 + 1):
-                    for l in range(lmax + 1):
-                        for m in range(-l, l + 1):
-                            # Skip combinations that violate the m-selection rule
-                            if -M + m0 + m != 0:
-                                continue
-                            G[L, L + M, l0, lmax + m0, l, lmax + m] = _gaunt_coeff(
-                                L, M, l0, m0, l, m
-                            )
-    return G
 
 
 def toroidal_e_from_radial_b(B_radial: torch.Tensor, omega: float, radius: float) -> torch.Tensor:
@@ -275,48 +255,18 @@ def _build_mixing_matrix_spectral(
     where M encodes convolution of Y_s(lm) with Faraday diagonal F(l) using
     Gaunt coefficients.
     """
-    device = Y_s_spectral.device
-    dtype = torch.complex128
-    G = _build_gaunt_tensor(lmax)
-    F_flat = _build_faraday_diag(lmax, omega, radius, device=device, dtype=dtype)
+    # Dense Gaunt assembly has been removed. Spectral mixing now routes through
+    # the precomputed sparse Gaunt path used by GUI workflows.
+    from gaunt.assemble_gaunt_checkpoints import assemble_in_memory
+    from europa_model.solver_variants.solver_variant_precomputed import (
+        _build_mixing_matrix_precomputed_sparse,
+        _trim_gaunt_sparse,
+    )
 
-    n_harm = (lmax + 1) * (lmax + 1)  # (l+1)^2 canonical count
-    M = torch.zeros((n_harm, n_harm), device=device, dtype=dtype)
-    G_t = torch.from_numpy(G).to(dtype=dtype, device=device)
-
-    def lm_index(l: int, m: int) -> int:
-        idx = 0
-        for l2 in range(lmax + 1):
-            for m2 in range(-l2, l2 + 1):
-                if l2 == l and m2 == m:
-                    return idx
-                idx += 1
-        return -1
-
-    # indices: p = (L,M_idx), q = (l',m'), r = (l0,m0)
-    for L in range(lmax + 1):
-        for M_idx in range(-L, L + 1):
-            p_flat = lm_index(L, M_idx)
-            for lprime in range(lmax + 1):
-                # Faraday diagonal depends only on l'
-                F_lprime = F_flat[lm_index(lprime, 0)]
-                for mprime in range(-lprime, lprime + 1):
-                    q_flat = lm_index(lprime, mprime)
-                    accum = 0.0 + 0.0j
-                    for l0 in range(lmax + 1):
-                        for m0 in range(-l0, l0 + 1):
-                            Y_r = Y_s_spectral[l0, lmax + m0]
-                            G_val = G_t[
-                                L,
-                                L + M_idx,
-                                l0,
-                                lmax + m0,
-                                lprime,
-                                lmax + mprime,
-                            ]
-                            accum = accum + Y_r * F_lprime * G_val
-                    M[p_flat, q_flat] = accum
-    return M
+    cache_dir = Path("gaunt/data/gaunt_cache_wigxjpf")
+    G_sparse, _ = assemble_in_memory(cache_dir=cache_dir, lmax_limit=lmax, verbose=False)
+    G_trim = _trim_gaunt_sparse(G_sparse, lmax_out=lmax, lmax_y=lmax, lmax_b=lmax)
+    return _build_mixing_matrix_precomputed_sparse(lmax, omega, radius, Y_s_spectral, G_trim)
 
 
 def solve_uniform_first_order_sim(sim: PhasorSimulation) -> PhasorSimulation:
