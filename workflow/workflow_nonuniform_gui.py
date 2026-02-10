@@ -41,6 +41,8 @@ STATE_DIR = BASE_RUN_DIR
 FIG_DIR = BASE_RUN_DIR / "figures"
 LOG_PATH = STATE_DIR / "log.txt"
 GAUNT_CACHE = Path("gaunt/data/gaunt_cache_wigxjpf")
+DEFAULT_SPECTRAL_COUPLING = "v_toroidal"
+COUPLING_OPTIONS = ("gaunt", "v_toroidal")
 
 
 def _log(text_widget: tk.Text, msg: str) -> None:
@@ -601,7 +603,11 @@ def _build_phasor_base(state) -> PhasorSimulation:
     )
 
 
-def step3_solve_currents(first_order_only: bool, log) -> Path:
+def step3_solve_currents(first_order_only: bool, log, coupling: str = DEFAULT_SPECTRAL_COUPLING) -> Path:
+    coupling_key = str(coupling).strip().lower()
+    if coupling_key not in COUPLING_OPTIONS:
+        raise RuntimeError(f"Unknown coupling mode: {coupling}")
+
     state = _load_state("ambient.pt")
     grid_cfg: GridConfig = state["grid_cfg"]
     base = _build_phasor_base(state)
@@ -621,9 +627,14 @@ def step3_solve_currents(first_order_only: bool, log) -> Path:
             "Rebuild the Gaunt cache to at least the requested lmax or lower lmax."
         )
 
-    log("Building sparse mixing matrix...")
+    log(f"Building sparse mixing matrix (coupling={coupling_key})...")
     mixing_matrix = _build_mixing_matrix_precomputed_sparse(
-        grid_cfg.lmax, base.omega, base.radius_m, base.admittance_spectral, G_sparse
+        grid_cfg.lmax,
+        base.omega,
+        base.radius_m,
+        base.admittance_spectral,
+        G_sparse,
+        coupling=coupling_key,
     )
 
     def _log_matrix_diagnostics(name: str, A: torch.Tensor) -> None:
@@ -693,7 +704,7 @@ def step3_solve_currents(first_order_only: bool, log) -> Path:
                 "Warning: first-order response energy exceeds source energy "
                 f"(resp={resp_energy:.3e} > src={src_energy:.3e})."
             )
-        sim_out.solver_variant = "spectral_first_order_precomputed_gaunt_sparse"
+        sim_out.solver_variant = f"spectral_first_order_precomputed_{coupling_key}_sparse"
         label = "first_order"
     else:
         log("Solving self-consistent system (matrix inversion)...")
@@ -727,8 +738,7 @@ def step3_solve_currents(first_order_only: bool, log) -> Path:
         sim_out.B_tor_emit, sim_out.B_pol_emit, sim_out.B_rad_emit = inductance.spectral_b_from_surface_currents(
             sim_out.K_toroidal, sim_out.K_poloidal, radius=sim_out.radius_m
         )
-        sim_out.solver_variant = "spectral_self_consistent_precomputed_gaunt_sparse"
-        sim_out.solver_variant = "spectral_self_consistent_precomputed_gaunt_sparse"
+        sim_out.solver_variant = f"spectral_self_consistent_precomputed_{coupling_key}_sparse"
         label = "self_consistent"
         log("Self-consistent solve complete.")
 
@@ -856,7 +866,11 @@ def _clear_outputs(log) -> None:
     log(f"Cleared outputs in {FIG_DIR} and {STATE_DIR}.")
 
 
-def step6_iterative_solve(order: int, log) -> Path:
+def step6_iterative_solve(order: int, log, coupling: str = DEFAULT_SPECTRAL_COUPLING) -> Path:
+    coupling_key = str(coupling).strip().lower()
+    if coupling_key not in COUPLING_OPTIONS:
+        raise RuntimeError(f"Unknown coupling mode: {coupling}")
+
     state = _load_state("ambient.pt")
     grid_cfg: GridConfig = state["grid_cfg"]
     base = _build_phasor_base(state)
@@ -876,9 +890,14 @@ def step6_iterative_solve(order: int, log) -> Path:
             "Rebuild the Gaunt cache to at least the requested lmax or lower lmax."
         )
 
-    log("Building sparse mixing matrix...")
+    log(f"Building sparse mixing matrix (coupling={coupling_key})...")
     mixing_matrix = _build_mixing_matrix_precomputed_sparse(
-        grid_cfg.lmax, base.omega, base.radius_m, base.admittance_spectral, G_sparse
+        grid_cfg.lmax,
+        base.omega,
+        base.radius_m,
+        base.admittance_spectral,
+        G_sparse,
+        coupling=coupling_key,
     )
 
     sim_out = PhasorSimulation.from_serializable(base.to_serializable())
@@ -988,6 +1007,7 @@ def main():
         "overview_input": "overview_input.pt",
     }
     solve_mode_var = tk.StringVar(value="self_consistent")
+    coupling_var = tk.StringVar(value=DEFAULT_SPECTRAL_COUPLING)
     mode_labels = {
         "first_order": "first-order",
         "self_consistent": "self-consistent",
@@ -1282,14 +1302,31 @@ def main():
         value="iterative",
         selectcolor=mode_accents["iterative"],
     ).grid(row=7, column=3, sticky="w")
+    ttk.Label(frm, text="coupling").grid(row=7, column=4, sticky="e")
+    tk.Radiobutton(
+        frm,
+        text="Gaunt",
+        variable=coupling_var,
+        value="gaunt",
+    ).grid(row=7, column=5, sticky="w")
+    tk.Radiobutton(
+        frm,
+        text="V-toroidal",
+        variable=coupling_var,
+        value="v_toroidal",
+    ).grid(row=7, column=6, sticky="w")
 
     def _run_selected_solve():
         mode = _selected_mode()
         if mode == "first_order":
-            return step3_solve_currents(True, lambda msg: _log(log_widget, msg))
+            return step3_solve_currents(True, lambda msg: _log(log_widget, msg), coupling=coupling_var.get())
         if mode == "iterative":
-            return step6_iterative_solve(int(iter_order_var.get()), lambda msg: _log(log_widget, msg))
-        return step3_solve_currents(False, lambda msg: _log(log_widget, msg))
+            return step6_iterative_solve(
+                int(iter_order_var.get()),
+                lambda msg: _log(log_widget, msg),
+                coupling=coupling_var.get(),
+            )
+        return step3_solve_currents(False, lambda msg: _log(log_widget, msg), coupling=coupling_var.get())
 
     btn_step_solve = tk.Button(
         frm,

@@ -9,7 +9,7 @@ Baseline solver in solvers.py remains unchanged.
 """
 import os
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Literal, Tuple
 
 import numpy as np
 import torch
@@ -25,13 +25,40 @@ from europa_model.solvers import (
 from workflow.data_objects.phasor_data import PhasorSimulation
 from gaunt.assemble_gaunt_checkpoints import assemble_in_memory
 
+CouplingMode = Literal["gaunt", "v_toroidal"]
+
+
+def _ell_int(value: torch.Tensor | int) -> torch.Tensor | int:
+    return value * (value + 1)
+
+
+def _v_toroidal_factor_tensors(L: torch.Tensor, l0: torch.Tensor, l_in: torch.Tensor) -> torch.Tensor:
+    Lf = L.to(torch.float64)
+    l0f = l0.to(torch.float64)
+    l_inf = l_in.to(torch.float64)
+    ell_L = _ell_int(Lf)
+    ell_l0 = _ell_int(l0f)
+    ell_l_in = _ell_int(l_inf)
+    numer = 0.5 * (ell_L + ell_l_in - ell_l0)
+    denom = torch.sqrt(ell_L * ell_l_in)
+    valid = denom > 0
+    denom_safe = torch.where(valid, denom, torch.ones_like(denom))
+    factor = numer / denom_safe
+    factor = torch.where(valid, factor, torch.zeros_like(factor))
+    return factor
+
 
 def _all_lm(lmax: int) -> list[tuple[int, int]]:
     return [(l, m) for l in range(lmax + 1) for m in range(-l, l + 1)]
 
 
 def _build_mixing_matrix_precomputed(
-    lmax: int, omega: float, radius: float, Y_s_spectral: torch.Tensor, G: torch.Tensor
+    lmax: int,
+    omega: float,
+    radius: float,
+    Y_s_spectral: torch.Tensor,
+    G: torch.Tensor,
+    coupling: CouplingMode = "gaunt",
 ) -> torch.Tensor:
     """
     Build mixing matrix using cached Gaunt tensor.
@@ -47,11 +74,22 @@ def _build_mixing_matrix_precomputed(
     G = G.to(device=device, dtype=torch.float64)
     Gc = G.to(dtype=dtype)
 
-    # Broadcast: Gc[L,M,l0,m0,l,m] * Y[l0,m0] * F[l,m]
+    if coupling == "gaunt":
+        kernel = Gc
+    elif coupling == "v_toroidal":
+        L_idx = torch.arange(lmax + 1, device=device, dtype=torch.float64).view(lmax + 1, 1, 1, 1, 1, 1)
+        l0_idx = torch.arange(lmax + 1, device=device, dtype=torch.float64).view(1, 1, lmax + 1, 1, 1, 1)
+        l_in_idx = torch.arange(lmax + 1, device=device, dtype=torch.float64).view(1, 1, 1, 1, lmax + 1, 1)
+        factor = _v_toroidal_factor_tensors(L_idx, l0_idx, l_in_idx).to(dtype=dtype)
+        kernel = Gc * factor
+    else:
+        raise ValueError(f"Unknown coupling mode: {coupling}")
+
+    # Broadcast: kernel[L,M,l0,m0,l,m] * Y[l0,m0] * F[l,m]
     # Align Y on (l0, m0) axes of G, then add trailing dims for (l, m)
     Y_exp = Y.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)  # [1,1,l0,m0,1,1]
     F_exp = F.unsqueeze(0).unsqueeze(0).unsqueeze(2).unsqueeze(2)  # [1,1,1,1,l,m]
-    M_tensor = (Gc * Y_exp * F_exp).sum(dim=(2, 3))  # sum over l0,m0 -> [L,M,l,m]
+    M_tensor = (kernel * Y_exp * F_exp).sum(dim=(2, 3))  # sum over l0,m0 -> [L,M,l,m]
 
     # Map to flattened matrix directly
     lm_list = _all_lm(lmax)
@@ -65,7 +103,12 @@ def _build_mixing_matrix_precomputed(
 
 
 def _build_mixing_matrix_precomputed_sparse(
-    lmax: int, omega: float, radius: float, Y_s_spectral: torch.Tensor, G_sparse: torch.Tensor
+    lmax: int,
+    omega: float,
+    radius: float,
+    Y_s_spectral: torch.Tensor,
+    G_sparse: torch.Tensor,
+    coupling: CouplingMode = "gaunt",
 ) -> torch.Tensor:
     """
     Build mixing matrix using a sparse Gaunt tensor to avoid densification at high lmax.
@@ -118,7 +161,15 @@ def _build_mixing_matrix_precomputed_sparse(
 
     y_vals = Y_s_spectral.to(device=device, dtype=dtype)[l0, m0_idx]
     f_vals = F_flat[col_flat]
-    contrib = vals * y_vals * f_vals
+    if coupling == "gaunt":
+        kernel = vals
+    elif coupling == "v_toroidal":
+        factor = _v_toroidal_factor_tensors(L, l0, l_in).to(device=device, dtype=dtype)
+        kernel = vals * factor
+    else:
+        raise ValueError(f"Unknown coupling mode: {coupling}")
+
+    contrib = kernel * y_vals * f_vals
 
     flat_idx = row_flat * n + col_flat
     M.view(-1).index_add_(0, flat_idx, contrib)
@@ -167,6 +218,7 @@ def solve_spectral_self_consistent_sim_precomputed(
     cache_dir: str | Path = "gaunt/data/gaunt_cache_wigxjpf",
     gaunt_sparse: torch.Tensor | None = None,
     mixing_matrix: torch.Tensor | None = None,
+    coupling: CouplingMode = "gaunt",
 ) -> PhasorSimulation:
     """
     Self-consistent spectral solver using cached Gaunt tensor for mixing matrix build.
@@ -188,7 +240,14 @@ def solve_spectral_self_consistent_sim_precomputed(
             print("Building mixing matrix from provided sparse Gaunt tensor...", flush=True)
             G_sparse = gaunt_sparse
         G_trim = _trim_gaunt_sparse(G_sparse, lmax_out=lmax, lmax_y=lmax, lmax_b=lmax)
-        M = _build_mixing_matrix_precomputed_sparse(lmax, omega0, sim.radius_m, Y_s_spectral, G_trim)
+        M = _build_mixing_matrix_precomputed_sparse(
+            lmax,
+            omega0,
+            sim.radius_m,
+            Y_s_spectral,
+            G_trim,
+            coupling=coupling,
+        )
     else:
         print("Using provided mixing matrix (skipping Gaunt build)...", flush=True)
         M = mixing_matrix
@@ -211,5 +270,8 @@ def solve_spectral_self_consistent_sim_precomputed(
     sim.B_tor_emit = B_tor_emit
     sim.B_pol_emit = B_pol_emit
     sim.B_rad_emit = B_rad_emit
-    sim.solver_variant = "spectral_self_consistent_precomputed_gaunt"
+    if coupling == "v_toroidal":
+        sim.solver_variant = "spectral_self_consistent_precomputed_v_toroidal"
+    else:
+        sim.solver_variant = "spectral_self_consistent_precomputed_gaunt"
     return sim

@@ -11,7 +11,7 @@ Outputs: toroidal E, toroidal/poloidal currents, and emitted B field phasors.
 All inputs/outputs use spherical-harmonic layout [lmax+1, 2*lmax+1] with m index = m+lmax.
 """
 from pathlib import Path
-from typing import Tuple
+from typing import Literal, Tuple
 
 import numpy as np
 import torch
@@ -245,6 +245,7 @@ def _build_mixing_matrix_spectral(
     omega: float,
     radius: float,
     Y_s_spectral: torch.Tensor,
+    coupling: Literal["gaunt", "v_toroidal"] = "gaunt",
 ) -> torch.Tensor:
     """
     Build spectral mixing matrix M mapping external radial field b_ext_flat
@@ -266,7 +267,14 @@ def _build_mixing_matrix_spectral(
     cache_dir = Path("gaunt/data/gaunt_cache_wigxjpf")
     G_sparse, _ = assemble_in_memory(cache_dir=cache_dir, lmax_limit=lmax, verbose=False)
     G_trim = _trim_gaunt_sparse(G_sparse, lmax_out=lmax, lmax_y=lmax, lmax_b=lmax)
-    return _build_mixing_matrix_precomputed_sparse(lmax, omega, radius, Y_s_spectral, G_trim)
+    return _build_mixing_matrix_precomputed_sparse(
+        lmax,
+        omega,
+        radius,
+        Y_s_spectral,
+        G_trim,
+        coupling=coupling,
+    )
 
 
 def solve_uniform_first_order_sim(sim: PhasorSimulation) -> PhasorSimulation:
@@ -317,7 +325,10 @@ def solve_uniform_self_consistent_sim(sim: PhasorSimulation) -> PhasorSimulation
     return sim
 
 
-def solve_spectral_first_order_sim(sim: PhasorSimulation) -> PhasorSimulation:
+def solve_spectral_first_order_sim(
+    sim: PhasorSimulation,
+    coupling: Literal["gaunt", "v_toroidal"] = "gaunt",
+) -> PhasorSimulation:
     """
     Spectral (non-uniform) admittance, first-order (no self-field feedback).
     Uses only data from PhasorSimulation; returns updated instance.
@@ -332,7 +343,7 @@ def solve_spectral_first_order_sim(sim: PhasorSimulation) -> PhasorSimulation:
     E_tor = toroidal_e_from_radial_b(B_radial, omega0, sim.radius_m)
 
     b_flat = _flatten_lm(B_radial)
-    M = _build_mixing_matrix_spectral(lmax, omega0, sim.radius_m, Y_s_spectral)
+    M = _build_mixing_matrix_spectral(lmax, omega0, sim.radius_m, Y_s_spectral, coupling=coupling)
     k_flat = M @ b_flat
     K_tor = _unflatten_lm(k_flat, lmax)
     K_pol = torch.zeros_like(K_tor)
@@ -346,11 +357,17 @@ def solve_spectral_first_order_sim(sim: PhasorSimulation) -> PhasorSimulation:
     sim.B_tor_emit = B_tor_emit
     sim.B_pol_emit = B_pol_emit
     sim.B_rad_emit = B_rad_emit
-    sim.solver_variant = "spectral_first_order"
+    if coupling == "v_toroidal":
+        sim.solver_variant = "spectral_first_order_v_toroidal"
+    else:
+        sim.solver_variant = "spectral_first_order"
     return sim
 
 
-def solve_spectral_self_consistent_sim(sim: PhasorSimulation) -> PhasorSimulation:
+def solve_spectral_self_consistent_sim(
+    sim: PhasorSimulation,
+    coupling: Literal["gaunt", "v_toroidal"] = "gaunt",
+) -> PhasorSimulation:
     """
     Spectral (non-uniform) admittance, including self-field feedback.
     Uses only data from PhasorSimulation; returns updated instance.
@@ -365,7 +382,7 @@ def solve_spectral_self_consistent_sim(sim: PhasorSimulation) -> PhasorSimulatio
     E_tor = toroidal_e_from_radial_b(B_radial, omega0, sim.radius_m)
 
     b_ext_flat = _flatten_lm(B_radial)
-    M = _build_mixing_matrix_spectral(lmax, omega0, sim.radius_m, Y_s_spectral)
+    M = _build_mixing_matrix_spectral(lmax, omega0, sim.radius_m, Y_s_spectral, coupling=coupling)
     S_diag = _build_self_field_diag(lmax, sim.grid_positions.device, dtype)
     I = torch.eye(M.shape[0], device=M.device, dtype=dtype)
     A = I - torch.diag(S_diag) @ M
@@ -382,7 +399,10 @@ def solve_spectral_self_consistent_sim(sim: PhasorSimulation) -> PhasorSimulatio
     sim.B_tor_emit = B_tor_emit
     sim.B_pol_emit = B_pol_emit
     sim.B_rad_emit = B_rad_emit
-    sim.solver_variant = "spectral_self_consistent"
+    if coupling == "v_toroidal":
+        sim.solver_variant = "spectral_self_consistent_v_toroidal"
+    else:
+        sim.solver_variant = "spectral_self_consistent"
     return sim
 
 
