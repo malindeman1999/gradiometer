@@ -45,6 +45,11 @@ $$
 
 ## 2. Toroidal Basis Normalization
 
+For the three degree symbols that appear throughout:
+- $L$ (or $l_a$) denotes the output/current harmonic degree (mode index of $K_a$ and emitted-field mode index),
+- $l_0$ (or $l_\alpha$) denotes the conductivity/admittance harmonic degree,
+- $l_b$ denotes the input magnetic-field harmonic degree (for $b_b$ and $e_b$).
+
 Define toroidal VSH as
 
 $$

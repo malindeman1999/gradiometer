@@ -262,11 +262,10 @@ def _complex_sheet_admittance(
     sigma_s: torch.Tensor,
     omega: float,
     radius_m: float,
-    inductance_scale: float = 1.0,
 ) -> torch.Tensor:
     """Compute complex sheet admittance from thin-shell impedance model."""
     sigma_s = sigma_s.to(torch.float64)
-    X_s = float(inductance_scale) * omega * float(inductance.MU0) * radius_m / 2.0
+    X_s = 0.0
     R_s = torch.where(sigma_s > 0, 1.0 / sigma_s, torch.zeros_like(sigma_s))
     Z = R_s + 1j * X_s
     Y = torch.where(sigma_s > 0, 1.0 / Z, torch.zeros_like(Z))
@@ -389,7 +388,7 @@ def step1_build_grid_admittance(
     )
 
     omega = 2.0 * math.pi / (9.925 * 3600.0)
-    cond = _complex_sheet_admittance(cond_real, omega, grid_cfg.radius_m, inductance_scale=0.0)
+    cond = _complex_sheet_admittance(cond_real, omega, grid_cfg.radius_m)
     Y_s = sh_forward(cond, positions, lmax=grid_cfg.lmax, weights=weights)
 
     state = {

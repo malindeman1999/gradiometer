@@ -65,6 +65,10 @@ $$
 ### 4.2 Gradient Weight Identity
 
 Define $\ell(l)=l(l+1)$ and mode degrees $a\leftrightarrow(L,M)$, $\alpha\leftrightarrow(l_0,m_0)$, $b\leftrightarrow(l_b,m_b)$.
+Here:
+- $L$ is the output/current harmonic degree (the degree of $K_a$, and therefore of the emitted-field mode index),
+- $l_0$ is the conductivity/admittance harmonic degree (the degree of $A_\alpha$),
+- $l_b$ is the input magnetic-field harmonic degree (the degree of $b_b$ and $e_b$).
 
 $$
 \int_\Omega Y_\alpha\,(\nabla_s Y_a^*\cdot \nabla_s Y_b)\,d\Omega
@@ -207,4 +211,3 @@ Still approximate at model level:
 - Finite truncation at $l_{\max}$.
 - Numerical SH transforms/quadrature and conditioning.
 - Any downstream observation-space approximations not using exact analytic operators.
-

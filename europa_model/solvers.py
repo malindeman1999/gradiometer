@@ -1,14 +1,58 @@
 """
-Phasor-domain solvers using complex VSH.
+Phasor-domain toroidal spectral solver summary (conductivity -> gradient tensor).
 
-Variants:
+This module implements the spectral conductivity/admittance solve that produces
+surface current coefficients and emitted magnetic-field coefficients. In the
+non-uniform path, angular coupling can be either plain Gaunt ("gaunt") or the
+toroidal-normalized V kernel ("v_toroidal").
+
+Harmonic roles used in the equations below:
+- Output/current mode degree: L (index a)
+- Admittance/conductivity mode degree: l0 (index alpha)
+- Input magnetic-field mode degree: lb (index b)
+
+1) Conductivity/admittance representation
+   A(omega) is provided in SH space as A_alpha (called Y_s_spectral in code).
+
+2) Faraday map (implemented exactly once)
+   e_b = F_b b_b, with
+   F_b = -(i omega R) / [lb(lb+1)] for lb>=1, and F_b=0 for lb=0.
+
+3) Angular coupling kernel
+   Scalar Gaunt kernel:
+     G_{a alpha b} = integral Y_a^* Y_alpha Y_b dOmega
+   Toroidal-normalized V kernel (if coupling="v_toroidal"):
+     Vtilde_{a alpha b}
+       = 0.5[ell(L)+ell(lb)-ell(l0)] / sqrt(ell(L) ell(lb)) * G_{a alpha b},
+     with ell(n)=n(n+1), and Vtilde=0 when denominator is zero.
+
+4) Mixing matrix assembly
+   M_{ab} = sum_alpha A_alpha F_b K_{a alpha b},
+   where K is either G (gaunt mode) or Vtilde (v_toroidal mode).
+
+5) Self-consistent closure
+   A_lin = I - S M,
+   b_tot = A_lin^{-1} b_ext,
+   K_tor = M b_tot.
+   In first-order mode, b_tot is replaced by b_ext directly.
+
+6) Emitted field
+   (B_tor_emit, B_pol_emit, B_rad_emit) are computed from K_tor via
+   inductance.spectral_b_from_surface_currents(...).
+
+7) Gradient tensor relation (downstream)
+   The derivation-level relation is G_ip = dB_i/dx_p and
+   g = sqrt(sum_{i,p} |G_ip|^2).
+   This module provides spectral B and K required for that step; gradient
+   evaluation is performed downstream (gradient_utils / workflow rendering).
+
+Variants in this file:
 - Uniform admittance, first-order (no self-field feedback)
-- Uniform admittance, self-consistent (includes normal self-field)
-- Spectral (non-uniform) admittance, first-order (mode mixing via Gaunt coefficients)
-- Spectral (non-uniform) admittance, self-consistent (matrix solve including self-field)
+- Uniform admittance, self-consistent
+- Spectral (non-uniform) first-order
+- Spectral (non-uniform) self-consistent
 
-Outputs: toroidal E, toroidal/poloidal currents, and emitted B field phasors.
-All inputs/outputs use spherical-harmonic layout [lmax+1, 2*lmax+1] with m index = m+lmax.
+All SH tensors use layout [lmax+1, 2*lmax+1] with m index = m + lmax.
 """
 from pathlib import Path
 from typing import Literal, Tuple

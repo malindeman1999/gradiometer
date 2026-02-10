@@ -28,6 +28,10 @@ Mode labels:
 - Output mode: `a = (L, M)`
 - Admittance mode: `alpha = (l0, m0)`
 - Input mode: `b = (lp, mp)`
+- Degree meaning:
+  `L` = output/current harmonic degree (`K_{LM}`, and thus emitted-field mode index),
+  `l0` = conductivity/admittance harmonic degree (`Y_{s,l0m0}`),
+  `lp` = input magnetic-field harmonic degree (`b_{lp mp}` and `e_{lp mp}`).
 
 Define:
 

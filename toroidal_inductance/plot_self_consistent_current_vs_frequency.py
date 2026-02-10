@@ -91,14 +91,8 @@ def _run_single_frequency(
     b_amp_t: float,
     radius_m: float,
     sigma_sheet_s: float,
-    inductance_scale: float,
 ) -> tuple[float, dict[str, dict[str, float]]]:
     omega = 2.0 * math.pi * freq_hz
-    if inductance_scale != 0.0:
-        raise ValueError(
-            "inductance_scale is not supported in this sweep because the current "
-            "uniform self-consistent solver path expects real admittance."
-        )
     b_radial = _build_b_radial_mode(lmax=lmax, mode_l=mode_l, mode_m=mode_m, amplitude_t=b_amp_t)
     admittance_uniform = float(sigma_sheet_s)
     admittance_spectral = _build_uniform_admittance_spectral(lmax=lmax, sigma_sheet_s=sigma_sheet_s)
@@ -158,12 +152,6 @@ def main() -> None:
     )
     parser.add_argument("--b-amp-t", type=float, default=1.0, help="Forcing B_r mode amplitude [T].")
     parser.add_argument(
-        "--inductance-scale",
-        type=float,
-        default=0.0,
-        help="Must be 0 for this solver path (uniform self-consistent uses real Y_s).",
-    )
-    parser.add_argument(
         "--csv-out",
         type=Path,
         default=Path("toroidal_inductance/data/solver_current_vs_frequency.csv"),
@@ -202,7 +190,6 @@ def main() -> None:
             b_amp_t=args.b_amp_t,
             radius_m=args.radius_m,
             sigma_sheet_s=args.sigma_sheet_s,
-            inductance_scale=args.inductance_scale,
         )
         rows.append(
             {

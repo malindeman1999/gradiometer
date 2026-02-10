@@ -101,7 +101,7 @@ def main() -> None:
         computed_label = "Computed toroidal mode inductance (field-energy)"
         y_label = "Inductance L_l [H]"
     ax.plot(l_vals, l_data, "o-", lw=1.8, ms=4.5, label=computed_label)
-    ax.plot(l_grid, l_gui, "--", lw=2.0, label="GUI inductance_scale=1: mu0 R / 2")
+    ax.plot(l_grid, l_gui, "--", lw=2.0, label="Reference level: mu0 R / 2")
 
     if args.notes_profile == "geom":
         notes_label = "Notes scaling: mu0 R / (2l+1)"
@@ -128,7 +128,7 @@ def main() -> None:
     print(f"Saved plot: {args.output}")
     print(f"Data source: {args.data_path}")
     print(f"Radius used: {args.radius_m:.6e} m")
-    print(f"GUI scale=1 level: {MU0 * args.radius_m / 2.0:.6e} H")
+    print(f"Reference mu0 R / 2 level: {MU0 * args.radius_m / 2.0:.6e} H")
 
 
 if __name__ == "__main__":
