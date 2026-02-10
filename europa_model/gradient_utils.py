@@ -434,6 +434,7 @@ def render_gradient_map(
     faces: torch.Tensor | None = None,
     plotter: str = "pyvista",
     subdivisions: int = 0,
+    log_scale: bool = False,
 ) -> None:
     import matplotlib.pyplot as plt
     from workflow.plotting.sphere_roundtrip import sphere_image
@@ -490,7 +491,18 @@ def render_gradient_map(
     tri_verts = pts[face_np]
     vmax = float(face_vals.max()) if face_vals.size else 1.0
     vmax = vmax if vmax > 0 else 1.0
-    norm = mcolors.Normalize(vmin=0.0, vmax=vmax)
+    if log_scale:
+        positive = face_vals[face_vals > 0.0]
+        if positive.size:
+            vmin = float(np.quantile(positive, 0.01))
+            vmin = max(vmin, float(np.min(positive)))
+        else:
+            vmin = 1e-30
+        if vmax <= vmin:
+            vmax = vmin * 10.0
+        norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
+    else:
+        norm = mcolors.Normalize(vmin=0.0, vmax=vmax)
     cmap = plt.get_cmap("rainbow")
     colors = cmap(norm(face_vals))
 
@@ -530,7 +542,7 @@ def render_gradient_map(
     fig_save.colorbar(
         mappable,
         cax=cax,
-        label="|grad_B_emit| RSS (T/m)",
+        label="|grad_B_emit| RSS (T/m)" + (" [log]" if log_scale else ""),
     )
     plt.tight_layout()
     plt.savefig(save_path, dpi=220, bbox_inches="tight")
@@ -559,7 +571,7 @@ def render_gradient_map(
             ax=ax,
             shrink=0.8,
             pad=0.05,
-            label="|grad_B_emit| RSS (T/m)",
+            label="|grad_B_emit| RSS (T/m)" + (" [log]" if log_scale else ""),
         )
         plt.tight_layout()
         plt.show()

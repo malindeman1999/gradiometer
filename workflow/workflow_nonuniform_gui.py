@@ -271,6 +271,21 @@ def _complex_sheet_admittance(
     return Y.to(torch.complex128)
 
 
+def _component_sigma_map_from_x(
+    sigma0: float,
+    x_component: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Convert one log-space component into a conductivity map with mean sigma0."""
+    sigma = float(sigma0) * torch.exp(x_component.to(torch.float64))
+    w = weights.to(torch.float64)
+    wsum = float(w.sum().item())
+    mean_now = float((w * sigma).sum().item() / max(wsum, 1e-30))
+    if mean_now > 0.0:
+        sigma = sigma * (float(sigma0) / mean_now)
+    return sigma.to(torch.float64)
+
+
 def step1_build_grid_admittance(
     lmax: int,
     mean_cond: float,
@@ -278,7 +293,6 @@ def step1_build_grid_admittance(
     mode_l: int,
     mode_m: int,
     conductivity_model: str,
-    inductance_scale: float,
     log,
 ) -> Path:
     lmax = max(1, int(lmax))
@@ -312,12 +326,29 @@ def step1_build_grid_admittance(
         roundtrip_tol = 5e-6
     else:
         cfg = EuropaSnapshotConfig(seed=7)
-        cond_real, model_components = build_europa_snapshot_conductivity(
+        _cond_model, model_components = build_europa_snapshot_conductivity(
             positions=positions,
             weights=weights,
             sigma0=mean_val,
             cfg=cfg,
         )
+        x_conv = model_components.get("x_chem")
+        x_exchange = model_components.get("x_exchange")
+        x_flow = model_components.get("x_flow")
+        x_bg = model_components.get("x_bg")
+        if not all(isinstance(xi, torch.Tensor) for xi in (x_conv, x_exchange, x_flow, x_bg)):
+            raise RuntimeError("Europa snapshot components missing (x_chem/x_exchange/x_flow/x_bg).")
+        sigma_conv = _component_sigma_map_from_x(mean_val, x_conv, weights)
+        sigma_exchange = _component_sigma_map_from_x(mean_val, x_exchange, weights)
+        sigma_flow = _component_sigma_map_from_x(mean_val, x_flow, weights)
+        sigma_bg = _component_sigma_map_from_x(mean_val, x_bg, weights)
+        cond_real = 0.25 * (sigma_conv + sigma_exchange + sigma_flow + sigma_bg)
+        model_components["sigma_conv_only"] = sigma_conv
+        model_components["sigma_exchange_only"] = sigma_exchange
+        model_components["sigma_flow_only"] = sigma_flow
+        model_components["sigma_bg_only"] = sigma_bg
+        model_components["sigma_combined_rule"] = "avg_components"
+        log("Europa snapshot combine rule: sigma = average of component-only maps")
         roundtrip_tol = 3e-2
     realized_mean = float(cond_real.mean().item())
     realized_rms = float(torch.sqrt(((cond_real - realized_mean) ** 2).mean()).item())
@@ -356,8 +387,7 @@ def step1_build_grid_admittance(
     )
 
     omega = 2.0 * math.pi / (9.925 * 3600.0)
-    log(f"Inductance scale: {float(inductance_scale):.3f}")
-    cond = _complex_sheet_admittance(cond_real, omega, grid_cfg.radius_m, inductance_scale=inductance_scale)
+    cond = _complex_sheet_admittance(cond_real, omega, grid_cfg.radius_m, inductance_scale=0.0)
     Y_s = sh_forward(cond, positions, lmax=grid_cfg.lmax, weights=weights)
 
     state = {
@@ -383,7 +413,6 @@ def step1_build_grid_admittance(
         "sigma_frac_rms": frac_rms,
         "sigma_mode_l": int(mode_l),
         "sigma_mode_m": int(mode_m),
-        "inductance_scale": float(inductance_scale),
     }
     if model_components:
         state.update(model_components)
@@ -750,6 +779,27 @@ def step4_render_gradient(label: str, altitude_m: float, log, plotter: str) -> P
     return save_path
 
 
+def step4_render_gradient_log100(label: str, log, plotter: str) -> Path:
+    payload = _load_solution(label)
+    sim_out: PhasorSimulation = payload["phasor_sim"]
+    grid_state = _load_state("grid_admittance.pt")
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    altitude_m = 100e3
+    title = "RSS |grad_B_emit| at alt=100 km (log scale)"
+    save_path = FIG_DIR / f"nonuniform_grad_{int(altitude_m):d}m_{label}_log.png"
+    render_gradient_map(
+        sim_out,
+        altitude_m=altitude_m,
+        save_path=str(save_path),
+        title=title,
+        faces=grid_state["faces"],
+        plotter=plotter,
+        log_scale=True,
+    )
+    log(f"Rendered log-scale gradient map to {save_path}")
+    return save_path
+
+
 def _flatten_harmonics(coeffs: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return l, m, |coeff| arrays in canonical (l,m) order."""
     lmax = coeffs.shape[-2] - 1
@@ -1028,8 +1078,8 @@ def main():
         _set_button_state(btn_step2, grid_ok, completed=ambient_ok)
         _set_button_state(btn_step_solve, ambient_ok, completed=selected_ok, color=selected_color if ambient_ok else None)
         _set_button_state(btn_overview, selected_ok, color=selected_color if selected_ok else None)
-        _set_button_state(btn_grad0, selected_ok, color=selected_color if selected_ok else None)
         _set_button_state(btn_grad100, selected_ok, color=selected_color if selected_ok else None)
+        _set_button_state(btn_grad100_log, selected_ok, color=selected_color if selected_ok else None)
         _set_button_state(btn_harm, selected_ok, color=selected_color if selected_ok else None)
 
     # Step 0: load latest run folder
@@ -1128,9 +1178,6 @@ def main():
     ttk.Label(frm, text="frac RMS").grid(row=3, column=7, sticky="e")
     frac_rms_var = tk.StringVar(value="0.05")
     ttk.Entry(frm, textvariable=frac_rms_var, width=6).grid(row=3, column=8, sticky="w")
-    ttk.Label(frm, text="extra inducance scale (x)").grid(row=3, column=9, sticky="e")
-    inductance_scale_var = tk.StringVar(value="0.0")
-    ttk.Entry(frm, textvariable=inductance_scale_var, width=6).grid(row=3, column=10, sticky="w")
 
     btn_step1 = tk.Button(
         frm,
@@ -1146,7 +1193,6 @@ def main():
                     int(mode_l_var.get()),
                     int(mode_m_var.get()),
                     conductivity_model_var.get(),
-                    float(inductance_scale_var.get()),
                     lambda msg: _log(log_widget, msg),
                 ),
             )[1],
@@ -1178,8 +1224,6 @@ def main():
                 mode_l_var.set(str(int(state["sigma_mode_l"])))
             if "sigma_mode_m" in state:
                 mode_m_var.set(str(int(state["sigma_mode_m"])))
-            if "inductance_scale" in state:
-                inductance_scale_var.set(str(float(state["inductance_scale"])))
             if "conductivity_model" in state:
                 conductivity_model_var.set(str(state["conductivity_model"]))
             _log(log_widget, "Step 0: refreshed GUI inputs from loaded state.")
@@ -1264,17 +1308,6 @@ def main():
         ),
     )
     btn_overview.grid(row=8, column=3, padx=4, sticky="w")
-    btn_grad0 = tk.Button(
-        frm,
-        text="Gradients @ surface (self-consistent)",
-        wraplength=180,
-        justify="left",
-        command=lambda: run_step_ui(
-            btn_grad0,
-            lambda: step4_render_gradient(_selected_mode(), 0.0, lambda msg: _log(log_widget, msg), plotter_var.get()),
-        ),
-    )
-    btn_grad0.grid(row=8, column=4, padx=4, sticky="w")
     btn_grad100 = tk.Button(
         frm,
         text="Gradients @ 100 km (self-consistent)",
@@ -1285,7 +1318,18 @@ def main():
             lambda: step4_render_gradient(_selected_mode(), 100e3, lambda msg: _log(log_widget, msg), plotter_var.get()),
         ),
     )
-    btn_grad100.grid(row=8, column=5, padx=4, sticky="w")
+    btn_grad100.grid(row=8, column=4, padx=4, sticky="w")
+    btn_grad100_log = tk.Button(
+        frm,
+        text="Gradients @ 100 km (log scale)",
+        wraplength=180,
+        justify="left",
+        command=lambda: run_step_ui(
+            btn_grad100_log,
+            lambda: step4_render_gradient_log100(_selected_mode(), lambda msg: _log(log_widget, msg), plotter_var.get()),
+        ),
+    )
+    btn_grad100_log.grid(row=8, column=5, padx=4, sticky="w")
     btn_harm = tk.Button(
         frm,
         text="Harmonics (ambient vs emitted)",
@@ -1304,8 +1348,8 @@ def main():
         solve_mode_header_var.set(f"Step 4-6: {label} solve")
         btn_step_solve.config(text=f"Solve {label}")
         btn_overview.config(text=f"Overview ({label})")
-        btn_grad0.config(text=f"Gradients @ surface ({label})")
         btn_grad100.config(text=f"Gradients @ 100 km ({label})")
+        btn_grad100_log.config(text=f"Gradients @ 100 km (log, {label})")
 
     solve_mode_var.trace_add("write", lambda *_: (_update_selected_mode_labels(), _update_button_states()))
     _update_selected_mode_labels()

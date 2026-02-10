@@ -17,7 +17,7 @@ class EuropaSnapshotConfig:
     n_exchange_sites: int = 5
     exchange_amp: float = 0.45
     exchange_width_deg: float = 18.0
-    exchange_target_max_s: float = 1.0e5
+    exchange_target_max_s: float = 2.0e5
     flow_anisotropy: float = 0.20
     background_amp: float = 0.08
     seed: int = 7
@@ -94,9 +94,9 @@ def build_europa_snapshot_conductivity(
     grid_lmax = max(1, int(round(math.sqrt(float(n_nodes)))) - 1)
 
     # "Convection" component stored under x_chem key for backward compatibility.
-    # Requested target: l=32, m=3 (or nearest available if grid lmax is smaller).
-    l_conv = min(32, grid_lmax)
-    m_conv = min(3, l_conv)
+    # Requested target: l=8, m=1 (or nearest available if grid lmax is smaller).
+    l_conv = min(8, grid_lmax)
+    m_conv = min(1, l_conv)
     coeffs_conv = torch.zeros((l_conv + 1, 2 * l_conv + 1), dtype=torch.complex128)
     c_conv = 1.0 + 0.0j
     coeffs_conv[l_conv, l_conv + m_conv] = c_conv
