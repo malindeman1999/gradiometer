@@ -66,19 +66,27 @@ def sphere_image(
     plotter: str = "pyvista",
     cmap: str = "viridis",
     symmetric: bool = False,
+    vmin: float | None = None,
+    vmax: float | None = None,
     elev: float = 20.0,
     azim: float = 30.0,
 ) -> np.ndarray:
     face_vals = _face_values_from_nodes(values, faces)
-    if symmetric:
-        vmax = float(max(np.max(np.abs(face_vals)), 1e-12))
-        norm = mcolors.Normalize(vmin=-vmax, vmax=vmax)
+    if vmin is not None or vmax is not None:
+        vmin_use = float(np.min(face_vals)) if vmin is None else float(vmin)
+        vmax_use = float(np.max(face_vals)) if vmax is None else float(vmax)
+        if vmax_use <= vmin_use:
+            vmax_use = vmin_use + 1e-12
+        norm = mcolors.Normalize(vmin=vmin_use, vmax=vmax_use)
+    elif symmetric:
+        vmax_sym = float(max(np.max(np.abs(face_vals)), 1e-12))
+        norm = mcolors.Normalize(vmin=-vmax_sym, vmax=vmax_sym)
     else:
-        vmin = float(np.min(face_vals))
-        vmax = float(np.max(face_vals))
-        if vmax <= vmin:
-            vmax = vmin + 1e-12
-        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        vmin_auto = float(np.min(face_vals))
+        vmax_auto = float(np.max(face_vals))
+        if vmax_auto <= vmin_auto:
+            vmax_auto = vmin_auto + 1e-12
+        norm = mcolors.Normalize(vmin=vmin_auto, vmax=vmax_auto)
 
     if plotter == "pyvista":
         try:

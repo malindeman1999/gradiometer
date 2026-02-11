@@ -9,7 +9,7 @@ Baseline solver in solvers.py remains unchanged.
 """
 import os
 from pathlib import Path
-from typing import Dict, Literal, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -24,8 +24,6 @@ from europa_model.solvers import (
 )
 from workflow.data_objects.phasor_data import PhasorSimulation
 from gaunt.assemble_gaunt_checkpoints import assemble_in_memory
-
-CouplingMode = Literal["gaunt", "v_toroidal"]
 
 
 def _ell_int(value: torch.Tensor | int) -> torch.Tensor | int:
@@ -58,7 +56,6 @@ def _build_mixing_matrix_precomputed(
     radius: float,
     Y_s_spectral: torch.Tensor,
     G: torch.Tensor,
-    coupling: CouplingMode = "gaunt",
 ) -> torch.Tensor:
     """
     Build mixing matrix using cached Gaunt tensor.
@@ -74,16 +71,11 @@ def _build_mixing_matrix_precomputed(
     G = G.to(device=device, dtype=torch.float64)
     Gc = G.to(dtype=dtype)
 
-    if coupling == "gaunt":
-        kernel = Gc
-    elif coupling == "v_toroidal":
-        L_idx = torch.arange(lmax + 1, device=device, dtype=torch.float64).view(lmax + 1, 1, 1, 1, 1, 1)
-        l0_idx = torch.arange(lmax + 1, device=device, dtype=torch.float64).view(1, 1, lmax + 1, 1, 1, 1)
-        l_in_idx = torch.arange(lmax + 1, device=device, dtype=torch.float64).view(1, 1, 1, 1, lmax + 1, 1)
-        factor = _v_toroidal_factor_tensors(L_idx, l0_idx, l_in_idx).to(dtype=dtype)
-        kernel = Gc * factor
-    else:
-        raise ValueError(f"Unknown coupling mode: {coupling}")
+    L_idx = torch.arange(lmax + 1, device=device, dtype=torch.float64).view(lmax + 1, 1, 1, 1, 1, 1)
+    l0_idx = torch.arange(lmax + 1, device=device, dtype=torch.float64).view(1, 1, lmax + 1, 1, 1, 1)
+    l_in_idx = torch.arange(lmax + 1, device=device, dtype=torch.float64).view(1, 1, 1, 1, lmax + 1, 1)
+    factor = _v_toroidal_factor_tensors(L_idx, l0_idx, l_in_idx).to(dtype=dtype)
+    kernel = Gc * factor
 
     # Broadcast: kernel[L,M,l0,m0,l,m] * Y[l0,m0] * F[l,m]
     # Align Y on (l0, m0) axes of G, then add trailing dims for (l, m)
@@ -108,7 +100,6 @@ def _build_mixing_matrix_precomputed_sparse(
     radius: float,
     Y_s_spectral: torch.Tensor,
     G_sparse: torch.Tensor,
-    coupling: CouplingMode = "gaunt",
 ) -> torch.Tensor:
     """
     Build mixing matrix using a sparse Gaunt tensor to avoid densification at high lmax.
@@ -161,13 +152,8 @@ def _build_mixing_matrix_precomputed_sparse(
 
     y_vals = Y_s_spectral.to(device=device, dtype=dtype)[l0, m0_idx]
     f_vals = F_flat[col_flat]
-    if coupling == "gaunt":
-        kernel = vals
-    elif coupling == "v_toroidal":
-        factor = _v_toroidal_factor_tensors(L, l0, l_in).to(device=device, dtype=dtype)
-        kernel = vals * factor
-    else:
-        raise ValueError(f"Unknown coupling mode: {coupling}")
+    factor = _v_toroidal_factor_tensors(L, l0, l_in).to(device=device, dtype=dtype)
+    kernel = vals * factor
 
     contrib = kernel * y_vals * f_vals
 
@@ -218,7 +204,6 @@ def solve_spectral_self_consistent_sim_precomputed(
     cache_dir: str | Path = "gaunt/data/gaunt_cache_wigxjpf",
     gaunt_sparse: torch.Tensor | None = None,
     mixing_matrix: torch.Tensor | None = None,
-    coupling: CouplingMode = "gaunt",
 ) -> PhasorSimulation:
     """
     Self-consistent spectral solver using cached Gaunt tensor for mixing matrix build.
@@ -246,7 +231,6 @@ def solve_spectral_self_consistent_sim_precomputed(
             sim.radius_m,
             Y_s_spectral,
             G_trim,
-            coupling=coupling,
         )
     else:
         print("Using provided mixing matrix (skipping Gaunt build)...", flush=True)
@@ -270,8 +254,5 @@ def solve_spectral_self_consistent_sim_precomputed(
     sim.B_tor_emit = B_tor_emit
     sim.B_pol_emit = B_pol_emit
     sim.B_rad_emit = B_rad_emit
-    if coupling == "v_toroidal":
-        sim.solver_variant = "spectral_self_consistent_precomputed_v_toroidal"
-    else:
-        sim.solver_variant = "spectral_self_consistent_precomputed_gaunt"
+    sim.solver_variant = "spectral_self_consistent_precomputed_v_toroidal"
     return sim

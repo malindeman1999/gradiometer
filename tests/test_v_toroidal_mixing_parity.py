@@ -27,7 +27,7 @@ def _random_gaunt_dense(lmax: int, seed: int = 7) -> torch.Tensor:
     return g
 
 
-def test_dense_sparse_parity_for_gaunt_and_v_toroidal() -> None:
+def test_dense_sparse_parity_for_v_toroidal() -> None:
     lmax = 2
     omega = 1.234
     radius = 1.56e6
@@ -41,11 +41,6 @@ def test_dense_sparse_parity_for_gaunt_and_v_toroidal() -> None:
     Y_imag = torch.randn((lmax + 1, 2 * lmax + 1), generator=gen, dtype=torch.float64)
     Y = (Y_real + 1j * Y_imag).to(torch.complex128)
 
-    M_dense_gaunt = _build_mixing_matrix_precomputed(lmax, omega, radius, Y, G_dense, coupling="gaunt")
-    M_sparse_gaunt = _build_mixing_matrix_precomputed_sparse(lmax, omega, radius, Y, G_sparse, coupling="gaunt")
-    assert torch.allclose(M_dense_gaunt, M_sparse_gaunt, rtol=1e-10, atol=1e-10)
-
-    M_dense_v = _build_mixing_matrix_precomputed(lmax, omega, radius, Y, G_dense, coupling="v_toroidal")
-    M_sparse_v = _build_mixing_matrix_precomputed_sparse(lmax, omega, radius, Y, G_sparse, coupling="v_toroidal")
+    M_dense_v = _build_mixing_matrix_precomputed(lmax, omega, radius, Y, G_dense)
+    M_sparse_v = _build_mixing_matrix_precomputed_sparse(lmax, omega, radius, Y, G_sparse)
     assert torch.allclose(M_dense_v, M_sparse_v, rtol=1e-10, atol=1e-10)
-

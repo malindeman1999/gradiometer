@@ -451,6 +451,10 @@ def render_gradient_map(
     else:
         face_np = faces.detach().cpu().numpy() if isinstance(faces, torch.Tensor) else faces
     show_matplotlib = plotter != "pyvista"
+    vmin_data = float(rss.min()) if rss.size else 0.0
+    vmax_data = float(rss.max()) if rss.size else 1.0
+    if vmax_data <= vmin_data:
+        vmax_data = vmin_data + max(abs(vmin_data) * 1e-6, 1e-30)
     if plotter == "pyvista":
         pyvista_shown = False
         try:
@@ -466,6 +470,7 @@ def render_gradient_map(
                 mesh,
                 scalars="value",
                 cmap="rainbow",
+                clim=[vmin_data, vmax_data],
                 show_edges=False,
                 smooth_shading=False,
                 lighting=False,
@@ -489,8 +494,10 @@ def render_gradient_map(
 
     face_vals = rss[face_np].mean(axis=1)
     tri_verts = pts[face_np]
+    vmin = float(face_vals.min()) if face_vals.size else 0.0
     vmax = float(face_vals.max()) if face_vals.size else 1.0
-    vmax = vmax if vmax > 0 else 1.0
+    if vmax <= vmin:
+        vmax = vmin + max(abs(vmin) * 1e-6, 1e-30)
     if log_scale:
         positive = face_vals[face_vals > 0.0]
         if positive.size:
@@ -502,7 +509,7 @@ def render_gradient_map(
             vmax = vmin * 10.0
         norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
     else:
-        norm = mcolors.Normalize(vmin=0.0, vmax=vmax)
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
     cmap = plt.get_cmap("rainbow")
     colors = cmap(norm(face_vals))
 
@@ -573,5 +580,167 @@ def render_gradient_map(
             pad=0.05,
             label="|grad_B_emit| RSS (T/m)" + (" [log]" if log_scale else ""),
         )
+        plt.tight_layout()
+        plt.show()
+
+
+def render_b_magnitude_map(
+    sim: "PhasorSimulation",
+    altitude_m: float,
+    save_path: str,
+    title: str,
+    faces: torch.Tensor | None = None,
+    plotter: str = "pyvista",
+    subdivisions: int = 0,
+    log_scale: bool = False,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    if sim.K_toroidal is None:
+        raise ValueError("K_toroidal is required to render emitted-field magnitude.")
+
+    obs_radius = float(sim.radius_m + altitude_m)
+    scale = obs_radius / float(sim.radius_m)
+    positions = (sim.grid_positions * scale).to(dtype=torch.float64)
+    Br, Btheta, Bphi = toroidal_field_spherical(sim.K_toroidal, radius=float(sim.radius_m), positions=positions)
+    rss = torch.sqrt(torch.abs(Br) ** 2 + torch.abs(Btheta) ** 2 + torch.abs(Bphi) ** 2).cpu().numpy()
+
+    pts = positions.detach().cpu().numpy()
+    if faces is None:
+        from scipy.spatial import ConvexHull
+        face_np = ConvexHull(pts).simplices.astype(np.int64)
+    else:
+        face_np = faces.detach().cpu().numpy() if isinstance(faces, torch.Tensor) else faces
+    show_matplotlib = plotter != "pyvista"
+    if plotter == "pyvista":
+        pyvista_shown = False
+        try:
+            import pyvista as pv
+
+            face_prefix = np.full((face_np.shape[0], 1), 3, dtype=np.int64)
+            pv_faces = np.hstack((face_prefix, face_np)).reshape(-1)
+            mesh = pv.PolyData(pts, pv_faces)
+            mesh.point_data["value"] = rss
+            pl = pv.Plotter(off_screen=False, window_size=(1100, 900))
+            pl.set_background("white")
+            pl.add_mesh(
+                mesh,
+                scalars="value",
+                cmap="rainbow",
+                show_edges=False,
+                smooth_shading=False,
+                lighting=False,
+            )
+            pl.add_title(title)
+            pl.view_isometric()
+            pl.show(auto_close=False)
+            pyvista_shown = True
+            try:
+                pl.screenshot(save_path)
+            except Exception:
+                pass
+            pl.close()
+            pyvista_shown = True
+        except Exception:
+            if pyvista_shown:
+                pass
+
+    import matplotlib.colors as mcolors
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    face_vals = rss[face_np].mean(axis=1)
+    tri_verts = pts[face_np]
+    vmin = float(face_vals.min()) if face_vals.size else 0.0
+    vmax = float(face_vals.max()) if face_vals.size else 1.0
+    if vmax <= vmin:
+        vmax = vmin + max(abs(vmin) * 1e-6, 1e-30)
+    if log_scale:
+        positive = face_vals[face_vals > 0.0]
+        if positive.size:
+            vmin = float(np.quantile(positive, 0.01))
+            vmin = max(vmin, float(np.min(positive)))
+        else:
+            vmin = 1e-30
+        if vmax <= vmin:
+            vmax = vmin * 10.0
+        norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
+    else:
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = plt.get_cmap("rainbow")
+    colors = cmap(norm(face_vals))
+
+    lim = float(np.max(np.abs(pts)))
+    lim_save = lim * 0.8
+
+    fig_save = plt.figure(figsize=(10.5, 6))
+    grid = fig_save.add_gridspec(1, 3, width_ratios=[1, 1, 0.05], wspace=-0.02)
+    axes_save = [
+        fig_save.add_subplot(grid[0, 0], projection="3d"),
+        fig_save.add_subplot(grid[0, 1], projection="3d"),
+    ]
+    cax = fig_save.add_subplot(grid[0, 2])
+    for ax, view_label, azim in (
+        (axes_save[0], "Front", 0),
+        (axes_save[1], "Back", 180),
+    ):
+        collection = Poly3DCollection(
+            tri_verts,
+            facecolors=colors,
+            edgecolor="none",
+            linewidth=0.05,
+            antialiased=True,
+        )
+        ax.add_collection3d(collection)
+        ax.set_xlim(-lim_save, lim_save)
+        ax.set_ylim(-lim_save, lim_save)
+        ax.set_zlim(-lim_save, lim_save)
+        ax.set_box_aspect([1, 1, 1])
+        ax.set_axis_off()
+        ax.set_title(view_label, pad=8)
+        ax.view_init(elev=0, azim=azim)
+    fig_save.suptitle(title, y=0.98)
+    mappable = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    mappable.set_array(face_vals)
+    cb_save = fig_save.colorbar(
+        mappable,
+        cax=cax,
+        label="|B_emit| RSS (T)" + (" [log]" if log_scale else ""),
+    )
+    if not log_scale:
+        ticks = np.linspace(vmin, vmax, 6)
+        cb_save.set_ticks(ticks)
+        cb_save.ax.set_yticklabels([f"{t:.3e}" for t in ticks])
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.close(fig_save)
+
+    if show_matplotlib:
+        fig_show = plt.figure(figsize=(7, 6))
+        ax = fig_show.add_subplot(1, 1, 1, projection="3d")
+        collection = Poly3DCollection(
+            tri_verts,
+            facecolors=colors,
+            edgecolor="none",
+            linewidth=0.05,
+            antialiased=True,
+        )
+        ax.add_collection3d(collection)
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_zlim(-lim, lim)
+        ax.set_box_aspect([1, 1, 1])
+        ax.set_axis_off()
+        ax.set_title(title, pad=12)
+        cb = fig_show.colorbar(
+            mappable,
+            ax=ax,
+            shrink=0.8,
+            pad=0.05,
+            label="|B_emit| RSS (T)" + (" [log]" if log_scale else ""),
+        )
+        if not log_scale:
+            ticks = np.linspace(vmin, vmax, 6)
+            cb.set_ticks(ticks)
+            cb.ax.set_yticklabels([f"{t:.3e}" for t in ticks])
         plt.tight_layout()
         plt.show()

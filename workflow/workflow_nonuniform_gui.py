@@ -1,9 +1,10 @@
-"""
-GUI for running the non-uniform demo pipeline in four stages:
-1) Build grid + admittance (selectable conductivity model)
-2) Build ambient field
-3) Solve currents (self-consistent by default, or first-order)
-4) Render overview and gradient plots
+﻿"""
+GUI for running the non-uniform demo pipeline in staged steps:
+1) Run folder management
+2) Build grid + admittance (selectable conductivity model)
+3) Admittance checks/plots
+4) Build ambient field
+5) Solve + renders/diagnostics
 
 Each step saves its state so runs can be resumed later.
 """
@@ -29,7 +30,7 @@ from europa_model.solver_variants.solver_variant_precomputed import (
     _build_mixing_matrix_precomputed_sparse,
 )
 from europa_model import inductance
-from europa_model.gradient_utils import render_gradient_map
+from europa_model.gradient_utils import render_gradient_map, render_b_magnitude_map
 from workflow.plotting.render_demo_overview import render_demo_overview
 from workflow.plotting.sphere_roundtrip import build_roundtrip_grid, sphere_image
 from gaunt.assemble_gaunt_checkpoints import assemble_in_memory
@@ -41,8 +42,6 @@ STATE_DIR = BASE_RUN_DIR
 FIG_DIR = BASE_RUN_DIR / "figures"
 LOG_PATH = STATE_DIR / "log.txt"
 GAUNT_CACHE = Path("gaunt/data/gaunt_cache_wigxjpf")
-DEFAULT_SPECTRAL_COUPLING = "v_toroidal"
-COUPLING_OPTIONS = ("gaunt", "v_toroidal")
 
 
 def _log(text_widget: tk.Text, msg: str) -> None:
@@ -135,7 +134,7 @@ def _synthesize_sigma_field(
     mode_m: int,
     log=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build a real conductivity field with target RMS and single (l,±m) modes."""
+    """Build a real conductivity field with target RMS and single (l,Â±m) modes."""
     mode_l = int(max(0, min(mode_l, lmax)))
     mode_m = int(max(0, min(abs(mode_m), mode_l)))
     frac_rms = max(0.0, float(frac_rms))
@@ -419,7 +418,7 @@ def step1_build_grid_admittance(
         state.update(model_components)
     path = _save_state("grid_admittance.pt", state)
     log(
-        f"Step 1 complete (lmax={lmax}, nodes={grid['n_points']}, faces={grid['n_faces']}). "
+        f"Step 2 complete (lmax={lmax}, nodes={grid['n_points']}, faces={grid['n_faces']}). "
         f"Saved grid+admittance to {path}"
     )
     return path, int(grid["n_points"]), int(grid["n_faces"])
@@ -433,20 +432,6 @@ def step1b_plot_roundtrip(log, plotter: str) -> None:
     recon = sh_inverse(coeffs, positions, weights)
     recon = recon.reshape(-1).cpu().numpy()
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    idx = np.arange(recon.size)
-    for ax, a, label in (
-        (axes[0], recon.real, "Real"),
-        (axes[1], recon.imag, "Imag"),
-    ):
-        ax.scatter(idx, a, s=8, alpha=0.7, label="Spectral reconstruction")
-        ax.set_title(f"{label} part: spectral reconstruction")
-        ax.set_xlabel("Grid point index")
-        ax.set_ylabel("Admittance (S)")
-        ax.legend(loc="best", frameon=False)
-
-    fig.tight_layout()
-    plt.show()
     sigma_grid = state.get("sigma_grid")
     if sigma_grid is not None:
         sigma_vals = sigma_grid.to(torch.float64).reshape(-1).cpu().numpy()
@@ -457,7 +442,7 @@ def step1b_plot_roundtrip(log, plotter: str) -> None:
             faces=state["faces"],
             plotter=plotter,
         )
-    log("Step 1b complete. Displayed spectral reconstruction plots.")
+    log("Step 3 complete. Displayed conductivity/admittance sphere plots.")
 
 
 def step1b_plot_admittance_power(log) -> None:
@@ -465,7 +450,7 @@ def step1b_plot_admittance_power(log) -> None:
     coeffs = state.get("admittance_spectral")
     sigma_coeffs = state.get("sigma_spectral")
     if coeffs is None or sigma_coeffs is None:
-        raise RuntimeError("Missing admittance_spectral or sigma_spectral. Run Step 1 before plotting magnitudes.")
+        raise RuntimeError("Missing admittance_spectral or sigma_spectral. Run Step 2 before plotting magnitudes.")
     model_key = str(state.get("conductivity_model", "synthetic_sh"))
     if model_key == "synthetic_sh":
         mode_l = state.get("sigma_mode_l", None)
@@ -481,36 +466,8 @@ def step1b_plot_admittance_power(log) -> None:
         width = float(state.get("snapshot_exchange_width_deg", 0.0))
         title_suffix = f"(model=europa_snapshot, sites={n_sites}, width={width:.1f} deg, seed={seed})"
 
-    l_b, m_b, mag = _flatten_harmonics(coeffs.to(torch.complex128))
+    l_b, _, mag = _flatten_harmonics(coeffs.to(torch.complex128))
     _, _, mag_sigma = _flatten_harmonics(sigma_coeffs.to(torch.complex128))
-    active = (mag > 0.0) | (mag_sigma > 0.0)
-    active_ls = l_b[active]
-    l_cut = int(active_ls.max()) if active_ls.size else 1
-    l_cut = max(l_cut, 1)
-    keep = l_b <= l_cut
-    x = np.arange(int(np.sum(keep)))
-    tick_idx = np.where(m_b[keep] == 0)[0]
-    tick_labels = [f"({l},0)" for l in l_b[keep][tick_idx]]
-
-    fig, axes = plt.subplots(2, 1, figsize=(7.5, 7.0), sharex=True)
-    sigma_vals = mag_sigma[keep]
-    sigma_vals_plot = np.where(sigma_vals > 0.0, sigma_vals, np.nan)
-    axes[0].bar(x, sigma_vals_plot, color="#5c9bd5")
-    axes[0].set_ylabel("|σ_s| (S)")
-    axes[0].set_title(f"Conductivity mode magnitude (S) {title_suffix}")
-    axes[0].grid(True, which="both", alpha=0.3)
-
-    y_vals = mag[keep]
-    y_vals_plot = np.where(y_vals > 0.0, y_vals, np.nan)
-    axes[1].bar(x, y_vals_plot, color="#ff9c43")
-    axes[1].set_xlabel("(l,m) ordering; ticks at m=0")
-    axes[1].set_xticks(tick_idx)
-    axes[1].set_xticklabels(tick_labels, rotation=90)
-    axes[1].set_ylabel("|Y_s| (S)")
-    axes[1].set_title(f"Admittance mode magnitude (S) {title_suffix}")
-    axes[1].grid(True, which="both", alpha=0.3)
-    fig.tight_layout()
-    plt.show()
 
     lmax = int(l_b.max()) if l_b.size else 0
     l_vals = np.arange(lmax + 1)
@@ -525,7 +482,7 @@ def step1b_plot_admittance_power(log) -> None:
     rss_sigma_plot = np.where(rss_sigma > 0.0, rss_sigma, np.nan)
     axes2[0].plot(l_vals, rss_sigma_plot, marker="o", linewidth=1.2, color="#5c9bd5")
     axes2[0].set_yscale("log")
-    axes2[0].set_ylabel("RSS |σ_s| (S)")
+    axes2[0].set_ylabel("RSS |Ïƒ_s| (S)")
     axes2[0].set_title(f"Conductivity by degree l (RSS, S) {title_suffix}")
     axes2[0].grid(True, which="both", alpha=0.3)
 
@@ -539,7 +496,7 @@ def step1b_plot_admittance_power(log) -> None:
 
     fig2.tight_layout()
     plt.show()
-    log("Step 1b complete. Plotted conductivity/admittance magnitudes and per-l RSS.")
+    log("Step 3 complete. Plotted conductivity/admittance power grouped by degree l.")
 
 
 def _plot_admittance_and_conductivity_spheres(
@@ -551,14 +508,30 @@ def _plot_admittance_and_conductivity_spheres(
 ) -> None:
     pts = positions.detach().cpu().numpy()
     fcs = faces.detach().cpu().numpy()
+    sigma_vals = np.asarray(sigma_real).reshape(-1)
+    adm_real = np.asarray(admittance).reshape(-1).real
+    adm_imag = np.asarray(admittance).reshape(-1).imag
+    sigma_vmin = float(np.min(sigma_vals))
+    sigma_vmax = float(np.max(sigma_vals))
     panels = [
-        ("Conductivity real(sigma_s)", np.asarray(sigma_real).reshape(-1), False, "viridis"),
-        ("Admittance real(Y_s)", np.asarray(admittance).reshape(-1).real, True, "coolwarm"),
-        ("Admittance imag(Y_s)", np.asarray(admittance).reshape(-1).imag, True, "coolwarm"),
+        ("Conductivity real(sigma_s)", sigma_vals, False, "viridis", sigma_vmin, sigma_vmax),
+        # Force real(Y_s) to the same color scale as real conductivity for direct visual comparison.
+        ("Admittance real(Y_s)", adm_real, False, "coolwarm", sigma_vmin, sigma_vmax),
+        ("Admittance imag(Y_s)", adm_imag, True, "coolwarm", None, None),
     ]
     fig, axes = plt.subplots(1, 3, figsize=(14, 5))
-    for ax, (title, vals, sym, cmap) in zip(axes, panels):
-        img = sphere_image(values=vals, positions=pts, faces=fcs, title=title, plotter=plotter, cmap=cmap, symmetric=sym)
+    for ax, (title, vals, sym, cmap, vmin, vmax) in zip(axes, panels):
+        img = sphere_image(
+            values=vals,
+            positions=pts,
+            faces=fcs,
+            title=title,
+            plotter=plotter,
+            cmap=cmap,
+            symmetric=sym,
+            vmin=vmin,
+            vmax=vmax,
+        )
         ax.imshow(img)
         ax.set_title(title)
         ax.axis("off")
@@ -578,7 +551,7 @@ def step2_build_ambient(log) -> Path:
         }
     )
     path = _save_state("ambient.pt", state1)
-    log(f"Step 2 complete. Saved ambient + B_radial to {path}")
+    log(f"Step 4 complete. Saved ambient + B_radial to {path}")
     return path
 
 
@@ -602,11 +575,7 @@ def _build_phasor_base(state) -> PhasorSimulation:
     )
 
 
-def step3_solve_currents(first_order_only: bool, log, coupling: str = DEFAULT_SPECTRAL_COUPLING) -> Path:
-    coupling_key = str(coupling).strip().lower()
-    if coupling_key not in COUPLING_OPTIONS:
-        raise RuntimeError(f"Unknown coupling mode: {coupling}")
-
+def step3_solve_currents(first_order_only: bool, log) -> Path:
     state = _load_state("ambient.pt")
     grid_cfg: GridConfig = state["grid_cfg"]
     base = _build_phasor_base(state)
@@ -626,14 +595,13 @@ def step3_solve_currents(first_order_only: bool, log, coupling: str = DEFAULT_SP
             "Rebuild the Gaunt cache to at least the requested lmax or lower lmax."
         )
 
-    log(f"Building sparse mixing matrix (coupling={coupling_key})...")
+    log("Building sparse mixing matrix (v_toroidal)...")
     mixing_matrix = _build_mixing_matrix_precomputed_sparse(
         grid_cfg.lmax,
         base.omega,
         base.radius_m,
         base.admittance_spectral,
         G_sparse,
-        coupling=coupling_key,
     )
 
     def _log_matrix_diagnostics(name: str, A: torch.Tensor) -> None:
@@ -703,7 +671,7 @@ def step3_solve_currents(first_order_only: bool, log, coupling: str = DEFAULT_SP
                 "Warning: first-order response energy exceeds source energy "
                 f"(resp={resp_energy:.3e} > src={src_energy:.3e})."
             )
-        sim_out.solver_variant = f"spectral_first_order_precomputed_{coupling_key}_sparse"
+        sim_out.solver_variant = "spectral_first_order_precomputed_v_toroidal_sparse"
         label = "first_order"
     else:
         log("Solving self-consistent system (matrix inversion)...")
@@ -737,7 +705,7 @@ def step3_solve_currents(first_order_only: bool, log, coupling: str = DEFAULT_SP
         sim_out.B_tor_emit, sim_out.B_pol_emit, sim_out.B_rad_emit = inductance.spectral_b_from_surface_currents(
             sim_out.K_toroidal, sim_out.K_poloidal, radius=sim_out.radius_m
         )
-        sim_out.solver_variant = f"spectral_self_consistent_precomputed_{coupling_key}_sparse"
+        sim_out.solver_variant = "spectral_self_consistent_precomputed_v_toroidal_sparse"
         label = "self_consistent"
         log("Self-consistent solve complete.")
 
@@ -747,7 +715,7 @@ def step3_solve_currents(first_order_only: bool, log, coupling: str = DEFAULT_SP
     }
     path = _save_state(f"solution_{label}.pt", payload)
     _save_state("solution_latest.pt", payload)
-    log(f"Step 3 complete. Saved solution to {path}")
+    log(f"Step 5 complete. Saved solution to {path}")
     return path
 
 
@@ -761,8 +729,8 @@ def step4_render_overview(label: str, log, plotter: str) -> Path:
     grid_state = _load_state("grid_admittance.pt")
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     out_path = FIG_DIR / f"nonuniform_{label}_overview.png"
-    log(f"Step 4 overview: label={label}, lmax={sim_out.lmax}, plotter={plotter}")
-    log("Step 4 overview: assembling input state for renderer...")
+    log(f"Step 5 overview: label={label}, lmax={sim_out.lmax}, plotter={plotter}")
+    log("Step 5 overview: assembling input state for renderer...")
     t0 = time.perf_counter()
     render_demo_overview(
         data_path=_save_state("overview_input.pt", payload),  # save tmp input for renderer
@@ -772,7 +740,7 @@ def step4_render_overview(label: str, log, plotter: str) -> Path:
         plotter=plotter,
     )
     dt = time.perf_counter() - t0
-    log(f"Step 4 overview: rendered in {dt:.1f}s -> {out_path}")
+    log(f"Step 5 overview: rendered in {dt:.1f}s -> {out_path}")
     return out_path
 
 
@@ -809,6 +777,27 @@ def step4_render_gradient_log100(label: str, log, plotter: str) -> Path:
     return save_path
 
 
+def step4_render_bmag100(label: str, log, plotter: str) -> Path:
+    payload = _load_solution(label)
+    sim_out: PhasorSimulation = payload["phasor_sim"]
+    grid_state = _load_state("grid_admittance.pt")
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    altitude_m = 100e3
+    faces = grid_state["faces"]
+    title = "RSS |B_emit| at alt=100 km"
+    save_path = FIG_DIR / f"nonuniform_bmag_{int(altitude_m):d}m_{label}.png"
+    render_b_magnitude_map(
+        sim_out,
+        altitude_m=altitude_m,
+        save_path=str(save_path),
+        title=title,
+        faces=faces,
+        plotter=plotter,
+    )
+    log(f"Rendered emitted-field magnitude map to {save_path}")
+    return save_path
+
+
 def _flatten_harmonics(coeffs: torch.Tensor) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return l, m, |coeff| arrays in canonical (l,m) order."""
     lmax = coeffs.shape[-2] - 1
@@ -826,35 +815,56 @@ def step4_plot_harmonics(label: str, log) -> None:
     sim_out: PhasorSimulation = payload["phasor_sim"]
     if sim_out.B_radial is None or sim_out.B_rad_emit is None:
         raise RuntimeError("Missing B_radial or B_rad_emit; run the solve before plotting harmonics.")
+    grid_state = _load_state("grid_admittance.pt")
+    sigma_coeffs = grid_state.get("sigma_spectral")
+    if sigma_coeffs is None:
+        raise RuntimeError("Missing sigma_spectral in grid_admittance state; run Step 2 before plotting harmonics.")
 
     l_b, m_b, mag_b = _flatten_harmonics(sim_out.B_radial)
     _, _, mag_emit = _flatten_harmonics(sim_out.B_rad_emit)
-    peak = float(max(np.max(mag_b), np.max(mag_emit), 1e-30))
-    eps = peak * 1e-9
-    active = (mag_b > eps) | (mag_emit > eps)
-    active_ls = l_b[active]
-    l_cut = int(active_ls.max()) if active_ls.size else 1
-    l_cut = max(l_cut, 1)
-    keep = l_b <= l_cut
-    x = np.arange(int(np.sum(keep)))
-    tick_idx = np.where(m_b[keep] == 0)[0]
-    tick_labels = [f"({l},0)" for l in l_b[keep][tick_idx]]
+    _, _, mag_sigma = _flatten_harmonics(sigma_coeffs.to(torch.complex128))
+    lmax = int(l_b.max()) if l_b.size else 0
+    l_vals = np.arange(lmax + 1)
+    rss_b = np.zeros(lmax + 1, dtype=np.float64)
+    rss_emit = np.zeros(lmax + 1, dtype=np.float64)
+    rss_sigma = np.zeros(lmax + 1, dtype=np.float64)
+    for l in range(lmax + 1):
+        mask = l_b == l
+        rss_b[l] = float(np.sqrt(np.sum(mag_b[mask] ** 2)))
+        rss_emit[l] = float(np.sqrt(np.sum(mag_emit[mask] ** 2)))
+        rss_sigma[l] = float(np.sqrt(np.sum(mag_sigma[mask] ** 2)))
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.5))
-    width = 0.42
-    ax.bar(x - width / 2, np.maximum(mag_b[keep], eps), width=width, label="ambient |B_rad|")
-    ax.bar(x + width / 2, np.maximum(mag_emit[keep], eps), width=width, label="emitted |B_rad_emit|")
-    ax.set_yscale("log")
-    ax.set_xlabel("(l,m) ordering; ticks at m=0")
-    ax.set_xticks(tick_idx)
-    ax.set_xticklabels(tick_labels, rotation=90)
-    ax.set_ylabel("RSS magnitude")
-    ax.set_title(f"Harmonics magnitude (ambient vs emitted) [{label}]")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend(frameon=False)
+    peak_b = float(max(np.max(rss_b), np.max(rss_emit), 1e-30))
+    eps_b = peak_b * 1e-9
+    rss_b_plot = np.maximum(rss_b, eps_b)
+    rss_emit_plot = np.maximum(rss_emit, eps_b)
+
+    fig, axes = plt.subplots(2, 1, figsize=(8.0, 7.2))
+    ax_top, ax_bottom = axes
+    ax_top.plot(l_vals, rss_b_plot, marker="o", linewidth=2.8, color="#1f77b4", label="ambient RSS |B_rad|")
+    ax_top.plot(l_vals, rss_emit_plot, marker="o", linewidth=1.2, color="#d62728", label="emitted RSS |B_rad_emit|")
+    ax_top.set_yscale("log")
+    ax_top.set_xlabel("Spherical harmonic degree l")
+    ax_top.set_ylabel("RSS |B| [T]")
+    ax_top.set_title(f"Magnetic harmonics by degree l (RSS) [{label}]")
+    ax_top.grid(True, which="both", alpha=0.3)
+    ax_top.legend(frameon=False)
+
+    peak_sigma = float(max(np.max(rss_sigma), 1e-30))
+    eps_sigma = peak_sigma * 1e-9
+    rss_sigma_plot = np.maximum(rss_sigma, eps_sigma)
+
+    ax_bottom.plot(l_vals, rss_sigma_plot, marker="o", linewidth=1.2, color="#5c9bd5", label="RSS |sigma_spectral|")
+    ax_bottom.set_yscale("log")
+    ax_bottom.set_xlabel("Spherical harmonic degree l")
+    ax_bottom.set_ylabel("RSS |sigma| [S]")
+    ax_bottom.set_title("Conductivity harmonic magnitude (RSS by degree l)")
+    ax_bottom.grid(True, which="both", alpha=0.3)
+    ax_bottom.legend(frameon=False)
+
     fig.tight_layout()
     plt.show()
-    log(f"Plotted harmonics magnitude for {label}.")
+    log(f"Plotted harmonics magnitude and conductivity harmonics for {label}.")
 
 
 def _clear_outputs(log) -> None:
@@ -865,11 +875,7 @@ def _clear_outputs(log) -> None:
     log(f"Cleared outputs in {FIG_DIR} and {STATE_DIR}.")
 
 
-def step6_iterative_solve(order: int, log, coupling: str = DEFAULT_SPECTRAL_COUPLING) -> Path:
-    coupling_key = str(coupling).strip().lower()
-    if coupling_key not in COUPLING_OPTIONS:
-        raise RuntimeError(f"Unknown coupling mode: {coupling}")
-
+def step6_iterative_solve(order: int, log) -> Path:
     state = _load_state("ambient.pt")
     grid_cfg: GridConfig = state["grid_cfg"]
     base = _build_phasor_base(state)
@@ -889,14 +895,13 @@ def step6_iterative_solve(order: int, log, coupling: str = DEFAULT_SPECTRAL_COUP
             "Rebuild the Gaunt cache to at least the requested lmax or lower lmax."
         )
 
-    log(f"Building sparse mixing matrix (coupling={coupling_key})...")
+    log("Building sparse mixing matrix (v_toroidal)...")
     mixing_matrix = _build_mixing_matrix_precomputed_sparse(
         grid_cfg.lmax,
         base.omega,
         base.radius_m,
         base.admittance_spectral,
         G_sparse,
-        coupling=coupling_key,
     )
 
     sim_out = PhasorSimulation.from_serializable(base.to_serializable())
@@ -940,7 +945,7 @@ def step6_iterative_solve(order: int, log, coupling: str = DEFAULT_SPECTRAL_COUP
         "phasor_sim": sim_out,
     }
     path = _save_state("solution_iterative.pt", payload)
-    log(f"Step 6 complete. Saved iterative solution to {path}")
+    log(f"Step 5 complete. Saved iterative solution to {path}")
     return path
 
 
@@ -1006,7 +1011,6 @@ def main():
         "overview_input": "overview_input.pt",
     }
     solve_mode_var = tk.StringVar(value="self_consistent")
-    coupling_var = tk.StringVar(value=DEFAULT_SPECTRAL_COUPLING)
     mode_labels = {
         "first_order": "first-order",
         "self_consistent": "self-consistent",
@@ -1036,10 +1040,10 @@ def main():
             raise FileNotFoundError(f"Source state file not found: {src}")
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.resolve() == dst.resolve():
-            log(f"Step 0 load: {state_key} already at standard path {dst}")
+            log(f"Step 1 load: {state_key} already at standard path {dst}")
             return dst
         shutil.copy2(src, dst)
-        log(f"Step 0 load: copied {src} -> {dst}")
+        log(f"Step 1 load: copied {src} -> {dst}")
         return dst
 
     def _save_state_to_path(state_key: str, target_path: str, log) -> Path:
@@ -1049,10 +1053,10 @@ def main():
             raise FileNotFoundError(f"Standard state file missing: {src}")
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.resolve() == dst.resolve():
-            log(f"Step 0 save: {state_key} stays at standard path {src}")
+            log(f"Step 1 save: {state_key} stays at standard path {src}")
             return dst
         shutil.copy2(src, dst)
-        log(f"Step 0 save: copied {src} -> {dst}")
+        log(f"Step 1 save: copied {src} -> {dst}")
         return dst
 
     def _set_button_state(
@@ -1100,9 +1104,10 @@ def main():
         _set_button_state(btn_grad100, selected_ok, color=selected_color if selected_ok else None)
         _set_button_state(btn_grad100_log, selected_ok, color=selected_color if selected_ok else None)
         _set_button_state(btn_harm, selected_ok, color=selected_color if selected_ok else None)
+        _set_button_state(btn_bmag100, selected_ok, color=selected_color if selected_ok else None)
 
-    # Step 0: load latest run folder
-    ttk.Label(frm, text="Step 0: Run folder").grid(row=0, column=0, sticky="w")
+    # Step 1: load latest run folder
+    ttk.Label(frm, text="Step 1: Run folder").grid(row=0, column=0, sticky="w")
     prefix_var = tk.StringVar(value="run")
     ttk.Label(frm, text="prefix").grid(row=0, column=1, sticky="e")
     ttk.Entry(frm, textvariable=prefix_var, width=10).grid(row=0, column=2, sticky="w")
@@ -1143,8 +1148,8 @@ def main():
     )
     btn_step0_rename.grid(row=0, column=8, padx=4, sticky="w")
 
-    # Inputs for step 1
-    ttk.Label(frm, text="Step 1: Grid + admittance").grid(row=1, column=0, sticky="w")
+    # Inputs for step 2
+    ttk.Label(frm, text="Step 2: Grid + admittance").grid(row=1, column=0, sticky="w")
     ttk.Label(frm, text="lmax").grid(row=1, column=1, sticky="e")
     lmax_var = tk.StringVar(value="36")
     ttk.Entry(frm, textvariable=lmax_var, width=6).grid(row=1, column=2, sticky="w")
@@ -1200,7 +1205,7 @@ def main():
 
     btn_step1 = tk.Button(
         frm,
-        text="Clear + Run Step 1",
+        text="Clear + Run Step 2",
         command=lambda: run_step(
             btn_step1,
             lambda: (
@@ -1245,13 +1250,13 @@ def main():
                 mode_m_var.set(str(int(state["sigma_mode_m"])))
             if "conductivity_model" in state:
                 conductivity_model_var.set(str(state["conductivity_model"]))
-            _log(log_widget, "Step 0: refreshed GUI inputs from loaded state.")
+            _log(log_widget, "Step 1: refreshed GUI inputs from loaded state.")
         except Exception as exc:  # noqa: BLE001
-            _log(log_widget, f"Step 0: unable to refresh GUI inputs ({exc})")
+            _log(log_widget, f"Step 1: unable to refresh GUI inputs ({exc})")
     _refresh_inputs_from_loaded_state()
 
-    # Step 1b
-    ttk.Label(frm, text="Step 1b: Admittance check").grid(row=5, column=0, sticky="w")
+    # Step 3
+    ttk.Label(frm, text="Step 3: Admittance check").grid(row=5, column=0, sticky="w")
     btn_step1b = tk.Button(
         frm,
         text="Admittance plots",
@@ -1268,8 +1273,8 @@ def main():
     )
     btn_step1b_power.grid(row=5, column=3, padx=6, sticky="w")
 
-    # Step 2
-    ttk.Label(frm, text="Step 2: Ambient field").grid(row=6, column=0, sticky="w")
+    # Step 4
+    ttk.Label(frm, text="Step 4: Ambient field").grid(row=6, column=0, sticky="w")
     btn_step2 = tk.Button(
         frm,
         text="Build ambient",
@@ -1277,8 +1282,8 @@ def main():
     )
     btn_step2.grid(row=6, column=2, padx=6, sticky="w")
 
-    # Step 4-6: Solve mode selector + shared plots
-    solve_mode_header_var = tk.StringVar(value="Step 4-6: Solve mode")
+    # Step 5: Solve mode selector + shared plots
+    solve_mode_header_var = tk.StringVar(value="Step 5: Solve mode")
     ttk.Label(frm, textvariable=solve_mode_header_var).grid(row=7, column=0, sticky="w")
     tk.Radiobutton(
         frm,
@@ -1301,31 +1306,13 @@ def main():
         value="iterative",
         selectcolor=mode_accents["iterative"],
     ).grid(row=7, column=3, sticky="w")
-    ttk.Label(frm, text="coupling").grid(row=7, column=4, sticky="e")
-    tk.Radiobutton(
-        frm,
-        text="Gaunt",
-        variable=coupling_var,
-        value="gaunt",
-    ).grid(row=7, column=5, sticky="w")
-    tk.Radiobutton(
-        frm,
-        text="V-toroidal",
-        variable=coupling_var,
-        value="v_toroidal",
-    ).grid(row=7, column=6, sticky="w")
-
     def _run_selected_solve():
         mode = _selected_mode()
         if mode == "first_order":
-            return step3_solve_currents(True, lambda msg: _log(log_widget, msg), coupling=coupling_var.get())
+            return step3_solve_currents(True, lambda msg: _log(log_widget, msg))
         if mode == "iterative":
-            return step6_iterative_solve(
-                int(iter_order_var.get()),
-                lambda msg: _log(log_widget, msg),
-                coupling=coupling_var.get(),
-            )
-        return step3_solve_currents(False, lambda msg: _log(log_widget, msg), coupling=coupling_var.get())
+            return step6_iterative_solve(int(iter_order_var.get()), lambda msg: _log(log_widget, msg))
+        return step3_solve_currents(False, lambda msg: _log(log_widget, msg))
 
     btn_step_solve = tk.Button(
         frm,
@@ -1366,6 +1353,16 @@ def main():
         ),
     )
     btn_grad100_log.grid(row=8, column=5, padx=4, sticky="w")
+    btn_bmag100 = tk.Button(
+        frm,
+        text="B magnitude @ 100 km",
+        wraplength=180,
+        command=lambda: run_step_ui(
+            btn_bmag100,
+            lambda: step4_render_bmag100(_selected_mode(), lambda msg: _log(log_widget, msg), plotter_var.get()),
+        ),
+    )
+    btn_bmag100.grid(row=8, column=6, padx=4, sticky="w")
     btn_harm = tk.Button(
         frm,
         text="Harmonics (ambient vs emitted)",
@@ -1376,16 +1373,17 @@ def main():
             lambda: step4_plot_harmonics(_selected_mode(), lambda msg: _log(log_widget, msg)),
         ),
     )
-    btn_harm.grid(row=8, column=6, padx=4, sticky="w")
+    btn_harm.grid(row=8, column=7, padx=4, sticky="w")
 
     def _update_selected_mode_labels() -> None:
         mode = _selected_mode()
         label = mode_labels[mode]
-        solve_mode_header_var.set(f"Step 4-6: {label} solve")
+        solve_mode_header_var.set(f"Step 5: {label} solve")
         btn_step_solve.config(text=f"Solve {label}")
         btn_overview.config(text=f"Overview ({label})")
         btn_grad100.config(text=f"Gradients @ 100 km ({label})")
         btn_grad100_log.config(text=f"Gradients @ 100 km (log, {label})")
+        btn_bmag100.config(text=f"B magnitude @ 100 km ({label})")
 
     solve_mode_var.trace_add("write", lambda *_: (_update_selected_mode_labels(), _update_button_states()))
     _update_selected_mode_labels()
@@ -1402,3 +1400,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

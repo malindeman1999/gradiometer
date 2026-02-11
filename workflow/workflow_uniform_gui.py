@@ -50,8 +50,6 @@ STATE_DIR = BASE_RUN_DIR
 FIG_DIR = BASE_RUN_DIR / "figures"
 LOG_PATH = STATE_DIR / "log.txt"
 GAUNT_CACHE = Path("gaunt/data/gaunt_cache_wigxjpf")
-DEFAULT_SPECTRAL_COUPLING = "v_toroidal"
-COUPLING_OPTIONS = ("gaunt", "v_toroidal")
 
 
 def _log(text_widget: tk.Text, msg: str) -> None:
@@ -428,11 +426,7 @@ def _matrix_condition(A: torch.Tensor) -> float:
         return float(s_max / s_min) if s_min != 0.0 else float("inf")
 
 
-def _build_mixing_matrix(state, log, coupling: str = DEFAULT_SPECTRAL_COUPLING) -> torch.Tensor:
-    coupling_key = str(coupling).strip().lower()
-    if coupling_key not in COUPLING_OPTIONS:
-        raise RuntimeError(f"Unknown coupling mode: {coupling}")
-
+def _build_mixing_matrix(state, log) -> torch.Tensor:
     grid_cfg: GridConfig = state["grid_cfg"]
     log(f"Assembling Gaunt tensor from {GAUNT_CACHE} (lmax_limit={grid_cfg.lmax})...")
     G_sparse, gaunt_meta = assemble_in_memory(
@@ -448,7 +442,7 @@ def _build_mixing_matrix(state, log, coupling: str = DEFAULT_SPECTRAL_COUPLING) 
             f"Gaunt cache incomplete: complete_L={complete_L}, required lmax={grid_cfg.lmax}. "
             "Rebuild the Gaunt cache to at least the requested lmax or lower lmax."
         )
-    log(f"Building sparse mixing matrix (coupling={coupling_key})...")
+    log("Building sparse mixing matrix (v_toroidal)...")
     Y_s_uniform = _uniformize_spectral_admittance(state["admittance_spectral"])
     return _build_mixing_matrix_precomputed_sparse(
         grid_cfg.lmax,
@@ -456,7 +450,6 @@ def _build_mixing_matrix(state, log, coupling: str = DEFAULT_SPECTRAL_COUPLING) 
         float(state["grid_cfg"].radius_m),
         Y_s_uniform,
         G_sparse,
-        coupling=coupling_key,
     )
 
 
@@ -484,14 +477,11 @@ def step3_uniform_self_consistent(log) -> Path:
     return path
 
 
-def step4_spectral_first_order(log, coupling: str = DEFAULT_SPECTRAL_COUPLING) -> Path:
+def step4_spectral_first_order(log) -> Path:
     state = _load_state("ambient.pt")
     grid_cfg: GridConfig = state["grid_cfg"]
     base = _build_phasor_base(state)
-    coupling_key = str(coupling).strip().lower()
-    if coupling_key not in COUPLING_OPTIONS:
-        raise RuntimeError(f"Unknown coupling mode: {coupling}")
-    mixing_matrix = _build_mixing_matrix(state, log, coupling=coupling_key)
+    mixing_matrix = _build_mixing_matrix(state, log)
     log("Spectral first-order solve...")
     sim_out = PhasorSimulation.from_serializable(base.to_serializable())
     sim_out.E_toroidal = toroidal_e_from_radial_b(sim_out.B_radial, sim_out.omega, sim_out.radius_m)
@@ -510,7 +500,7 @@ def step4_spectral_first_order(log, coupling: str = DEFAULT_SPECTRAL_COUPLING) -
             "Warning: spectral first-order response energy exceeds source energy "
             f"(resp={resp_energy:.3e} > src={src_energy:.3e})."
         )
-    sim_out.solver_variant = f"spectral_first_order_precomputed_{coupling_key}_sparse"
+    sim_out.solver_variant = "spectral_first_order_precomputed_v_toroidal_sparse"
     payload = {"label": "spectral_first_order", "phasor_sim": sim_out}
     path = _save_state("solution_spectral_first_order.pt", payload)
     _save_state("solution_latest.pt", payload)
@@ -518,14 +508,11 @@ def step4_spectral_first_order(log, coupling: str = DEFAULT_SPECTRAL_COUPLING) -
     return path
 
 
-def step5_spectral_self_consistent(log, coupling: str = DEFAULT_SPECTRAL_COUPLING) -> Path:
+def step5_spectral_self_consistent(log) -> Path:
     state = _load_state("ambient.pt")
     grid_cfg: GridConfig = state["grid_cfg"]
     base = _build_phasor_base(state)
-    coupling_key = str(coupling).strip().lower()
-    if coupling_key not in COUPLING_OPTIONS:
-        raise RuntimeError(f"Unknown coupling mode: {coupling}")
-    mixing_matrix = _build_mixing_matrix(state, log, coupling=coupling_key)
+    mixing_matrix = _build_mixing_matrix(state, log)
     log("Spectral self-consistent solve...")
     sim_out = PhasorSimulation.from_serializable(base.to_serializable())
     sim_out.E_toroidal = toroidal_e_from_radial_b(sim_out.B_radial, sim_out.omega, sim_out.radius_m)
@@ -545,7 +532,7 @@ def step5_spectral_self_consistent(log, coupling: str = DEFAULT_SPECTRAL_COUPLIN
     sim_out.B_tor_emit, sim_out.B_pol_emit, sim_out.B_rad_emit = inductance.spectral_b_from_surface_currents(
         sim_out.K_toroidal, sim_out.K_poloidal, radius=sim_out.radius_m
     )
-    sim_out.solver_variant = f"spectral_self_consistent_precomputed_{coupling_key}_sparse"
+    sim_out.solver_variant = "spectral_self_consistent_precomputed_v_toroidal_sparse"
     payload = {"label": "spectral_self_consistent", "phasor_sim": sim_out}
     path = _save_state("solution_spectral_self_consistent.pt", payload)
     _save_state("solution_latest.pt", payload)
@@ -646,14 +633,11 @@ def _clear_outputs(log) -> None:
     log(f"Cleared outputs in {FIG_DIR} and {STATE_DIR}.")
 
 
-def step6_spectral_iterative(order: int, log, coupling: str = DEFAULT_SPECTRAL_COUPLING) -> Path:
+def step6_spectral_iterative(order: int, log) -> Path:
     state = _load_state("ambient.pt")
     grid_cfg: GridConfig = state["grid_cfg"]
     base = _build_phasor_base(state)
-    coupling_key = str(coupling).strip().lower()
-    if coupling_key not in COUPLING_OPTIONS:
-        raise RuntimeError(f"Unknown coupling mode: {coupling}")
-    mixing_matrix = _build_mixing_matrix(state, log, coupling=coupling_key)
+    mixing_matrix = _build_mixing_matrix(state, log)
 
     sim_out = PhasorSimulation.from_serializable(base.to_serializable())
     sim_out.E_toroidal = toroidal_e_from_radial_b(sim_out.B_radial, sim_out.omega, sim_out.radius_m)
@@ -688,7 +672,7 @@ def step6_spectral_iterative(order: int, log, coupling: str = DEFAULT_SPECTRAL_C
     sim_out.B_tor_emit, sim_out.B_pol_emit, sim_out.B_rad_emit = inductance.spectral_b_from_surface_currents(
         sim_out.K_toroidal, sim_out.K_poloidal, radius=sim_out.radius_m
     )
-    sim_out.solver_variant = f"spectral_iterative_series_precomputed_{coupling_key}_sparse"
+    sim_out.solver_variant = "spectral_iterative_series_precomputed_v_toroidal_sparse"
     label = "spectral_iterative"
 
     payload = {
@@ -808,7 +792,6 @@ def main():
         "solution_latest": "solution_latest.pt",
         "overview_input": "overview_input.pt",
     }
-    coupling_var = tk.StringVar(value=DEFAULT_SPECTRAL_COUPLING)
 
     def _standard_state_path(state_key: str) -> Path:
         if state_key not in state_files:
@@ -1165,25 +1148,12 @@ def main():
 
     # Step 4: Spectral first-order + plots
     ttk.Label(frm, text="Step 4: Spectral first-order").grid(row=8, column=0, sticky="w")
-    ttk.Label(frm, text="coupling").grid(row=8, column=7, sticky="e")
-    tk.Radiobutton(
-        frm,
-        text="Gaunt",
-        variable=coupling_var,
-        value="gaunt",
-    ).grid(row=8, column=8, sticky="w")
-    tk.Radiobutton(
-        frm,
-        text="V-toroidal",
-        variable=coupling_var,
-        value="v_toroidal",
-    ).grid(row=8, column=9, sticky="w")
     btn_step4_spectral_first = tk.Button(
         frm,
         text="Solve spectral first-order",
         command=lambda: run_step(
             btn_step4_spectral_first,
-            lambda: step4_spectral_first_order(lambda msg: _log(log_widget, msg), coupling=coupling_var.get()),
+            lambda: step4_spectral_first_order(lambda msg: _log(log_widget, msg)),
         ),
     )
     btn_step4_spectral_first.grid(row=8, column=2, padx=4, sticky="w")
@@ -1239,7 +1209,7 @@ def main():
         text="Solve spectral self-consistent",
         command=lambda: run_step(
             btn_step5_spectral_self,
-            lambda: step5_spectral_self_consistent(lambda msg: _log(log_widget, msg), coupling=coupling_var.get()),
+            lambda: step5_spectral_self_consistent(lambda msg: _log(log_widget, msg)),
         ),
     )
     btn_step5_spectral_self.grid(row=9, column=2, padx=4, sticky="w")
@@ -1295,11 +1265,7 @@ def main():
         text="Solve spectral iterative",
         command=lambda: run_step(
             btn_step6_spectral_iter,
-            lambda: step6_spectral_iterative(
-                int(iter_order_var.get()),
-                lambda msg: _log(log_widget, msg),
-                coupling=coupling_var.get(),
-            ),
+            lambda: step6_spectral_iterative(int(iter_order_var.get()), lambda msg: _log(log_widget, msg)),
         ),
     )
     btn_step6_spectral_iter.grid(row=10, column=2, padx=4, sticky="w")

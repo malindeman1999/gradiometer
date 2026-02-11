@@ -37,7 +37,7 @@ Europa_transit_time = europa.transit_time
  
 
 gradiometer_length=10  # m
-gradiometer_points = 5  # odd number of points for gradiometer PSD model
+gradiometer_points = 2  # odd number of points for gradiometer PSD model
 gradiometer_output_quantity = "gradient"  # report gradient in nT/m (later plotted as pT/m)
 
 sample_period = 0.01  # 10 ms sampling cadence

@@ -2,9 +2,8 @@
 Phasor-domain toroidal spectral solver summary (conductivity -> gradient tensor).
 
 This module implements the spectral conductivity/admittance solve that produces
-surface current coefficients and emitted magnetic-field coefficients. In the
-non-uniform path, angular coupling can be either plain Gaunt ("gaunt") or the
-toroidal-normalized V kernel ("v_toroidal").
+surface current coefficients and emitted magnetic-field coefficients using the
+toroidal-normalized V coupling kernel.
 
 Harmonic roles used in the equations below:
 - Output/current mode degree: L (index a)
@@ -21,14 +20,13 @@ Harmonic roles used in the equations below:
 3) Angular coupling kernel
    Scalar Gaunt kernel:
      G_{a alpha b} = integral Y_a^* Y_alpha Y_b dOmega
-   Toroidal-normalized V kernel (if coupling="v_toroidal"):
+   Toroidal-normalized V kernel:
      Vtilde_{a alpha b}
        = 0.5[ell(L)+ell(lb)-ell(l0)] / sqrt(ell(L) ell(lb)) * G_{a alpha b},
      with ell(n)=n(n+1), and Vtilde=0 when denominator is zero.
 
 4) Mixing matrix assembly
-   M_{ab} = sum_alpha A_alpha F_b K_{a alpha b},
-   where K is either G (gaunt mode) or Vtilde (v_toroidal mode).
+   M_{ab} = sum_alpha A_alpha F_b Vtilde_{a alpha b}.
 
 5) Self-consistent closure
    A_lin = I - S M,
@@ -55,7 +53,7 @@ Variants in this file:
 All SH tensors use layout [lmax+1, 2*lmax+1] with m index = m + lmax.
 """
 from pathlib import Path
-from typing import Literal, Tuple
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -289,7 +287,6 @@ def _build_mixing_matrix_spectral(
     omega: float,
     radius: float,
     Y_s_spectral: torch.Tensor,
-    coupling: Literal["gaunt", "v_toroidal"] = "gaunt",
 ) -> torch.Tensor:
     """
     Build spectral mixing matrix M mapping external radial field b_ext_flat
@@ -317,7 +314,6 @@ def _build_mixing_matrix_spectral(
         radius,
         Y_s_spectral,
         G_trim,
-        coupling=coupling,
     )
 
 
@@ -371,7 +367,6 @@ def solve_uniform_self_consistent_sim(sim: PhasorSimulation) -> PhasorSimulation
 
 def solve_spectral_first_order_sim(
     sim: PhasorSimulation,
-    coupling: Literal["gaunt", "v_toroidal"] = "gaunt",
 ) -> PhasorSimulation:
     """
     Spectral (non-uniform) admittance, first-order (no self-field feedback).
@@ -387,7 +382,7 @@ def solve_spectral_first_order_sim(
     E_tor = toroidal_e_from_radial_b(B_radial, omega0, sim.radius_m)
 
     b_flat = _flatten_lm(B_radial)
-    M = _build_mixing_matrix_spectral(lmax, omega0, sim.radius_m, Y_s_spectral, coupling=coupling)
+    M = _build_mixing_matrix_spectral(lmax, omega0, sim.radius_m, Y_s_spectral)
     k_flat = M @ b_flat
     K_tor = _unflatten_lm(k_flat, lmax)
     K_pol = torch.zeros_like(K_tor)
@@ -401,16 +396,12 @@ def solve_spectral_first_order_sim(
     sim.B_tor_emit = B_tor_emit
     sim.B_pol_emit = B_pol_emit
     sim.B_rad_emit = B_rad_emit
-    if coupling == "v_toroidal":
-        sim.solver_variant = "spectral_first_order_v_toroidal"
-    else:
-        sim.solver_variant = "spectral_first_order"
+    sim.solver_variant = "spectral_first_order_v_toroidal"
     return sim
 
 
 def solve_spectral_self_consistent_sim(
     sim: PhasorSimulation,
-    coupling: Literal["gaunt", "v_toroidal"] = "gaunt",
 ) -> PhasorSimulation:
     """
     Spectral (non-uniform) admittance, including self-field feedback.
@@ -426,7 +417,7 @@ def solve_spectral_self_consistent_sim(
     E_tor = toroidal_e_from_radial_b(B_radial, omega0, sim.radius_m)
 
     b_ext_flat = _flatten_lm(B_radial)
-    M = _build_mixing_matrix_spectral(lmax, omega0, sim.radius_m, Y_s_spectral, coupling=coupling)
+    M = _build_mixing_matrix_spectral(lmax, omega0, sim.radius_m, Y_s_spectral)
     S_diag = _build_self_field_diag(lmax, sim.grid_positions.device, dtype)
     I = torch.eye(M.shape[0], device=M.device, dtype=dtype)
     A = I - torch.diag(S_diag) @ M
@@ -443,10 +434,7 @@ def solve_spectral_self_consistent_sim(
     sim.B_tor_emit = B_tor_emit
     sim.B_pol_emit = B_pol_emit
     sim.B_rad_emit = B_rad_emit
-    if coupling == "v_toroidal":
-        sim.solver_variant = "spectral_self_consistent_v_toroidal"
-    else:
-        sim.solver_variant = "spectral_self_consistent"
+    sim.solver_variant = "spectral_self_consistent_v_toroidal"
     return sim
 
 
