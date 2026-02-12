@@ -21,7 +21,11 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
-from workflow.ambient_field.ambient_driver import build_ambient_driver_x
+from workflow.ambient_field.ambient_driver import (
+    build_ambient_driver_x,
+    build_ambient_driver_y,
+    build_ambient_driver_z,
+)
 from europa_model.config import GridConfig, ModelConfig
 from europa_model.transforms import sh_forward, sh_inverse
 from europa_model.solvers import _flatten_lm, _unflatten_lm, toroidal_e_from_radial_b, _build_self_field_diag
@@ -306,13 +310,16 @@ def step1_build_grid_admittance(
     mode_l = int(mode_l)
     mode_m = int(mode_m)
     model_key = str(conductivity_model or "europa_snapshot").strip().lower()
-    if model_key not in {"synthetic_sh", "europa_snapshot"}:
+    if model_key not in {"uniform", "synthetic_sh", "europa_snapshot"}:
         raise RuntimeError(f"Unknown conductivity_model: {conductivity_model}")
     log(f"Conductivity model: {model_key}")
 
     sigma_coeffs_target = None
     model_components: dict[str, torch.Tensor | float | int] = {}
-    if model_key == "synthetic_sh":
+    if model_key == "uniform":
+        cond_real = torch.full_like(weights, fill_value=mean_val, dtype=torch.float64)
+        roundtrip_tol = 1e-10
+    elif model_key == "synthetic_sh":
         cond_real, sigma_coeffs_target = _synthesize_sigma_field(
             positions,
             weights,
@@ -460,11 +467,13 @@ def step1b_plot_admittance_power(log) -> None:
         mode_m_str = f"{int(mode_m)}" if mode_m is not None else "?"
         frac_rms_str = f"{float(frac_rms):.2%}" if frac_rms is not None else "?"
         title_suffix = f"(model=synthetic_sh, l={mode_l_str}, m=+/-{mode_m_str}, frac RMS {frac_rms_str})"
-    else:
+    elif model_key == "europa_snapshot":
         n_sites = int(state.get("snapshot_n_exchange_sites", 0))
         seed = int(state.get("snapshot_seed", -1))
         width = float(state.get("snapshot_exchange_width_deg", 0.0))
         title_suffix = f"(model=europa_snapshot, sites={n_sites}, width={width:.1f} deg, seed={seed})"
+    else:
+        title_suffix = f"(model={model_key})"
 
     l_b, _, mag = _flatten_harmonics(coeffs.to(torch.complex128))
     _, _, mag_sigma = _flatten_harmonics(sigma_coeffs.to(torch.complex128))
@@ -539,19 +548,47 @@ def _plot_admittance_and_conductivity_spheres(
     plt.show()
 
 
-def step2_build_ambient(log) -> Path:
+def step2_build_ambient(
+    direction_axis: str,
+    amplitude_t: float,
+    period_hours: float,
+    log,
+) -> Path:
     state1 = _load_state("grid_admittance.pt")
     grid_cfg: GridConfig = state1["grid_cfg"]
-    ambient_cfg, B_radial_spec, period_sec = build_ambient_driver_x(grid_cfg)
+    axis = str(direction_axis or "x").strip().lower()
+    if axis not in {"x", "y", "z"}:
+        raise RuntimeError(f"Unknown ambient direction axis: {direction_axis}")
+    amp_val = max(0.0, float(amplitude_t))
+    period_val = float(period_hours)
+    if period_val <= 0.0:
+        raise RuntimeError(f"Ambient period must be > 0 hours (got {period_hours}).")
+    builders = {
+        "x": build_ambient_driver_x,
+        "y": build_ambient_driver_y,
+        "z": build_ambient_driver_z,
+    }
+    ambient_cfg, B_radial_spec, period_sec = builders[axis](
+        grid_cfg,
+        period_hours=period_val,
+        amplitude_t=amp_val,
+        phase_rad=0.0,
+    )
     state1.update(
         {
             "ambient_cfg": ambient_cfg,
             "B_radial_spec": B_radial_spec,
             "period_sec": period_sec,
+            "ambient_direction": axis,
+            "ambient_amplitude_t": amp_val,
+            "ambient_period_hours": period_val,
         }
     )
     path = _save_state("ambient.pt", state1)
-    log(f"Step 4 complete. Saved ambient + B_radial to {path}")
+    log(
+        f"Step 4 complete. Saved ambient + B_radial to {path} "
+        f"(axis={axis.upper()}, amplitude={amp_val:.3e} T, period={period_val:.6g} h)"
+    )
     return path
 
 
@@ -1151,7 +1188,17 @@ def main():
     # Inputs for step 2
     ttk.Label(frm, text="Step 2: Grid + admittance").grid(row=1, column=0, sticky="w")
     ttk.Label(frm, text="lmax").grid(row=1, column=1, sticky="e")
-    lmax_var = tk.StringVar(value="36")
+    default_lmax = "36"
+    default_iter_order = "3"
+    default_plotter = "matplotlib"
+    default_conductivity_model = "europa_snapshot"
+    default_mode_l = "10"
+    default_mode_m = "2"
+    default_frac_rms = "0.05"
+    default_ambient_axis = "x"
+    default_ambient_amplitude = "1e-6"
+    default_ambient_period_hours = "9.925"
+    lmax_var = tk.StringVar(value=default_lmax)
     ttk.Entry(frm, textvariable=lmax_var, width=6).grid(row=1, column=2, sticky="w")
 
     ttk.Label(frm, text="# nodes").grid(row=1, column=3, sticky="e")
@@ -1171,22 +1218,25 @@ def main():
     ttk.Label(frm, textvariable=sh_count_var).grid(row=2, column=4, sticky="w")
 
     ttk.Label(frm, text="iter order").grid(row=2, column=5, sticky="e")
-    iter_order_var = tk.StringVar(value="3")
+    iter_order_var = tk.StringVar(value=default_iter_order)
     ttk.Entry(frm, textvariable=iter_order_var, width=6).grid(row=2, column=6, sticky="w")
 
     ttk.Label(frm, text="Sphere plotter").grid(row=2, column=7, sticky="e")
-    plotter_var = tk.StringVar(value="matplotlib")
+    plotter_var = tk.StringVar(value=default_plotter)
     tk.Radiobutton(frm, text="PyVista", variable=plotter_var, value="pyvista").grid(row=2, column=8, sticky="w")
     tk.Radiobutton(frm, text="Matplotlib", variable=plotter_var, value="matplotlib").grid(row=2, column=9, sticky="w")
 
     ttk.Label(frm, text="conductivity model").grid(row=4, column=0, sticky="w")
-    conductivity_model_var = tk.StringVar(value="europa_snapshot")
+    conductivity_model_var = tk.StringVar(value=default_conductivity_model)
     tk.Radiobutton(
-        frm, text="Europa snapshot", variable=conductivity_model_var, value="europa_snapshot"
+        frm, text="Uniform", variable=conductivity_model_var, value="uniform"
     ).grid(row=4, column=1, sticky="w")
     tk.Radiobutton(
-        frm, text="Existing synthetic", variable=conductivity_model_var, value="synthetic_sh"
+        frm, text="Europa snapshot", variable=conductivity_model_var, value="europa_snapshot"
     ).grid(row=4, column=2, sticky="w")
+    tk.Radiobutton(
+        frm, text="Existing synthetic", variable=conductivity_model_var, value="synthetic_sh"
+    ).grid(row=4, column=3, sticky="w")
 
     default_cfg = GridConfig(nside=1, lmax=1, radius_m=1.56e6, device="cpu")
     default_mean = 2.0 * default_cfg.seawater_conductivity_s_per_m * default_cfg.ocean_thickness_m
@@ -1194,14 +1244,41 @@ def main():
     mean_cond_var = tk.StringVar(value=f"{default_mean:.3e}")
     ttk.Entry(frm, textvariable=mean_cond_var, width=10).grid(row=3, column=2, sticky="w")
     ttk.Label(frm, text="target l").grid(row=3, column=3, sticky="e")
-    mode_l_var = tk.StringVar(value="10")
+    mode_l_var = tk.StringVar(value=default_mode_l)
     ttk.Entry(frm, textvariable=mode_l_var, width=6).grid(row=3, column=4, sticky="w")
     ttk.Label(frm, text="target |m|").grid(row=3, column=5, sticky="e")
-    mode_m_var = tk.StringVar(value="2")
+    mode_m_var = tk.StringVar(value=default_mode_m)
     ttk.Entry(frm, textvariable=mode_m_var, width=6).grid(row=3, column=6, sticky="w")
     ttk.Label(frm, text="frac RMS").grid(row=3, column=7, sticky="e")
-    frac_rms_var = tk.StringVar(value="0.05")
+    frac_rms_var = tk.StringVar(value=default_frac_rms)
     ttk.Entry(frm, textvariable=frac_rms_var, width=6).grid(row=3, column=8, sticky="w")
+    ambient_direction_var = tk.StringVar(value=default_ambient_axis)
+    ambient_amplitude_var = tk.StringVar(value=default_ambient_amplitude)
+    ambient_period_var = tk.StringVar(value=default_ambient_period_hours)
+
+    def _reset_inputs_to_defaults(log_reset: bool = True) -> None:
+        lmax_var.set(default_lmax)
+        mean_cond_var.set(f"{default_mean:.3e}")
+        mode_l_var.set(default_mode_l)
+        mode_m_var.set(default_mode_m)
+        frac_rms_var.set(default_frac_rms)
+        conductivity_model_var.set(default_conductivity_model)
+        ambient_direction_var.set(default_ambient_axis)
+        ambient_amplitude_var.set(default_ambient_amplitude)
+        ambient_period_var.set(default_ambient_period_hours)
+        iter_order_var.set(default_iter_order)
+        plotter_var.set(default_plotter)
+        solve_mode_var.set("self_consistent")
+        _update_grid_counts()
+        if log_reset:
+            _log(log_widget, "Reset GUI inputs to defaults.")
+
+    btn_step0_reset = tk.Button(
+        frm,
+        text="Reset defaults",
+        command=lambda: _reset_inputs_to_defaults(log_reset=True),
+    )
+    btn_step0_reset.grid(row=0, column=9, padx=4, sticky="w")
 
     btn_step1 = tk.Button(
         frm,
@@ -1231,25 +1308,44 @@ def main():
     )
     btn_step1.grid(row=3, column=11, padx=6, sticky="w")
     def _refresh_inputs_from_loaded_state() -> None:
-        if not _grid_exists():
-            return
         try:
-            state = _load_state("grid_admittance.pt")
-            lmax = int(getattr(state.get("grid_cfg"), "lmax", lmax_var.get()))
-            lmax_var.set(str(lmax))
-            node_count_var.set(str(int(state.get("node_count", _node_count_from_lmax(lmax)))))
-            face_count_var.set(str(int(state.get("face_count", max(4, int(node_count_var.get()) * 2 - 4)))))
-            _update_grid_counts()
-            if "sigma_mean" in state:
-                mean_cond_var.set(f"{float(state['sigma_mean']):.3e}")
-            if "sigma_frac_rms" in state:
-                frac_rms_var.set(str(float(state["sigma_frac_rms"])))
-            if "sigma_mode_l" in state:
-                mode_l_var.set(str(int(state["sigma_mode_l"])))
-            if "sigma_mode_m" in state:
-                mode_m_var.set(str(int(state["sigma_mode_m"])))
-            if "conductivity_model" in state:
-                conductivity_model_var.set(str(state["conductivity_model"]))
+            if _grid_exists():
+                state = _load_state("grid_admittance.pt")
+                lmax = int(getattr(state.get("grid_cfg"), "lmax", lmax_var.get()))
+                lmax_var.set(str(lmax))
+                node_count_var.set(str(int(state.get("node_count", _node_count_from_lmax(lmax)))))
+                face_count_var.set(str(int(state.get("face_count", max(4, int(node_count_var.get()) * 2 - 4)))))
+                _update_grid_counts()
+                if "sigma_mean" in state:
+                    mean_cond_var.set(f"{float(state['sigma_mean']):.3e}")
+                if "sigma_frac_rms" in state:
+                    frac_rms_var.set(str(float(state["sigma_frac_rms"])))
+                if "sigma_mode_l" in state:
+                    mode_l_var.set(str(int(state["sigma_mode_l"])))
+                if "sigma_mode_m" in state:
+                    mode_m_var.set(str(int(state["sigma_mode_m"])))
+                if "conductivity_model" in state:
+                    conductivity_model_var.set(str(state["conductivity_model"]))
+
+            if _ambient_exists():
+                astate = _load_state("ambient.pt")
+                axis = str(astate.get("ambient_direction", "x")).strip().lower()
+                if axis in {"x", "y", "z"}:
+                    ambient_direction_var.set(axis)
+                if "ambient_amplitude_t" in astate:
+                    ambient_amplitude_var.set(f"{float(astate['ambient_amplitude_t']):.6g}")
+                elif "ambient_cfg" in astate:
+                    amp = getattr(astate["ambient_cfg"], "amplitude_t", None)
+                    if amp is not None:
+                        ambient_amplitude_var.set(f"{float(amp):.6g}")
+                if "ambient_period_hours" in astate:
+                    ambient_period_var.set(f"{float(astate['ambient_period_hours']):.6g}")
+                elif "period_sec" in astate:
+                    ambient_period_var.set(f"{float(astate['period_sec']) / 3600.0:.6g}")
+                elif "ambient_cfg" in astate:
+                    omega = getattr(astate["ambient_cfg"], "omega_jovian", None)
+                    if omega is not None and float(omega) > 0.0:
+                        ambient_period_var.set(f"{(2.0 * math.pi / float(omega)) / 3600.0:.6g}")
             _log(log_widget, "Step 1: refreshed GUI inputs from loaded state.")
         except Exception as exc:  # noqa: BLE001
             _log(log_widget, f"Step 1: unable to refresh GUI inputs ({exc})")
@@ -1275,12 +1371,28 @@ def main():
 
     # Step 4
     ttk.Label(frm, text="Step 4: Ambient field").grid(row=6, column=0, sticky="w")
+    ttk.Label(frm, text="axis").grid(row=6, column=1, sticky="e")
+    tk.Radiobutton(frm, text="X", variable=ambient_direction_var, value="x").grid(row=6, column=2, sticky="w")
+    tk.Radiobutton(frm, text="Y", variable=ambient_direction_var, value="y").grid(row=6, column=3, sticky="w")
+    tk.Radiobutton(frm, text="Z", variable=ambient_direction_var, value="z").grid(row=6, column=4, sticky="w")
+    ttk.Label(frm, text="amplitude (T)").grid(row=6, column=5, sticky="e")
+    ttk.Entry(frm, textvariable=ambient_amplitude_var, width=10).grid(row=6, column=6, sticky="w")
+    ttk.Label(frm, text="period (h)").grid(row=6, column=7, sticky="e")
+    ttk.Entry(frm, textvariable=ambient_period_var, width=8).grid(row=6, column=8, sticky="w")
     btn_step2 = tk.Button(
         frm,
         text="Build ambient",
-        command=lambda: run_step(btn_step2, lambda: step2_build_ambient(lambda msg: _log(log_widget, msg))),
+        command=lambda: run_step(
+            btn_step2,
+            lambda: step2_build_ambient(
+                ambient_direction_var.get(),
+                float(ambient_amplitude_var.get()),
+                float(ambient_period_var.get()),
+                lambda msg: _log(log_widget, msg),
+            ),
+        ),
     )
-    btn_step2.grid(row=6, column=2, padx=6, sticky="w")
+    btn_step2.grid(row=6, column=9, padx=6, sticky="w")
 
     # Step 5: Solve mode selector + shared plots
     solve_mode_header_var = tk.StringVar(value="Step 5: Solve mode")

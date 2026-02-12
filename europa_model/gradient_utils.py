@@ -125,6 +125,32 @@ def finite_diff_gradients_cartesian_closed_form(
     return torch.stack(grads, dim=-1)  # [N,3,3]
 
 
+def finite_diff_gradients_cartesian_from_spectral(
+    B_tor: torch.Tensor,
+    B_pol: torch.Tensor,
+    B_rad: torch.Tensor,
+    positions: torch.Tensor,
+    delta: float = 1.0,
+) -> torch.Tensor:
+    """
+    Cartesian finite differences of the emitted field evaluated directly from spectra.
+    Returns [N,3,3] with dB_i/dx_j in Cartesian coordinates.
+    """
+    device = positions.device
+    dtype = positions.dtype
+    deltas = torch.eye(3, device=device, dtype=dtype) * delta
+    grads = []
+    for axis in range(3):
+        shift = deltas[axis]
+        pos_plus = positions + shift
+        pos_minus = positions - shift
+        Bp_cart = evaluate_field_from_spectral(B_tor, B_pol, B_rad, pos_plus)
+        Bm_cart = evaluate_field_from_spectral(B_tor, B_pol, B_rad, pos_minus)
+        grad_axis = (Bp_cart - Bm_cart) / (2.0 * delta)
+        grads.append(grad_axis)
+    return torch.stack(grads, dim=-1)  # [N,3,3]
+
+
 def finite_diff_gradients_spherical(
     J_tor: torch.Tensor,
     radius: float,
@@ -291,16 +317,52 @@ def toroidal_field_and_gradients_spherical(
     return _toroidal_field_and_gradients_spherical_core(J_tor, radius, positions, theta_fd_step)
 
 
-def rss_gradient_from_emit(sim: "PhasorSimulation", positions: torch.Tensor, obs_radius: float | None = None) -> torch.Tensor:
-    obs_r = sim.radius_m if obs_radius is None else float(obs_radius)
+def rss_gradient_from_emit(
+    sim: "PhasorSimulation",
+    positions: torch.Tensor,
+    obs_radius: float | None = None,
+    *,
+    fd_delta_m: float = 1000.0,
+    method: str = "cartesian_spectral",
+) -> torch.Tensor:
+    _ = sim.radius_m if obs_radius is None else float(obs_radius)
     K_tor = sim.K_toroidal
     if K_tor is None:
         raise ValueError("K_toroidal is required to evaluate emitted field at new radius.")
-    _, _, _, grad_Br, grad_Btheta, grad_Bphi = toroidal_field_and_gradients_spherical(
-        K_tor, radius=obs_r, positions=positions
-    )
-    grad_tensor = torch.stack([grad_Br, grad_Btheta, grad_Bphi], dim=1)  # [N,3,3]
-    return torch.linalg.norm(grad_tensor, dim=(1, 2))
+
+    method_key = str(method).strip().lower()
+    delta = float(max(1e-6, fd_delta_m))
+    source_radius = float(sim.radius_m)
+    if method_key == "cartesian_spectral":
+        if sim.B_tor_emit is None or sim.B_pol_emit is None or sim.B_rad_emit is None:
+            method_key = "cartesian_closed_form"
+        else:
+            grad_cart = finite_diff_gradients_cartesian_from_spectral(
+                sim.B_tor_emit,
+                sim.B_pol_emit,
+                sim.B_rad_emit,
+                positions=positions,
+                delta=delta,
+            )
+            return torch.linalg.norm(grad_cart, dim=(1, 2))
+
+    if method_key == "cartesian_closed_form":
+        grad_cart = finite_diff_gradients_cartesian_closed_form(
+            K_tor,
+            radius=source_radius,
+            positions=positions,
+            delta=delta,
+        )
+        return torch.linalg.norm(grad_cart, dim=(1, 2))
+
+    if method_key == "spherical_analytic":
+        _, _, _, grad_Br, grad_Btheta, grad_Bphi = toroidal_field_and_gradients_spherical(
+            K_tor, radius=source_radius, positions=positions
+        )
+        grad_tensor = torch.stack([grad_Br, grad_Btheta, grad_Bphi], dim=1)  # [N,3,3]
+        return torch.linalg.norm(grad_tensor, dim=(1, 2))
+
+    raise ValueError(f"Unknown gradient RSS method: {method}")
 
 
 def rss_gradient_cartesian_autograd(J_tor: torch.Tensor, radius: float, positions: torch.Tensor) -> torch.Tensor:
