@@ -261,6 +261,24 @@ def _load_state(name: str):
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
+def _clear_solution_states(log) -> None:
+    stale = [
+        "solution_first_order.pt",
+        "solution_self_consistent.pt",
+        "solution_iterative.pt",
+        "solution_latest.pt",
+        "overview_input.pt",
+    ]
+    removed = 0
+    for name in stale:
+        p = STATE_DIR / name
+        if p.exists():
+            p.unlink()
+            removed += 1
+    if removed > 0:
+        log(f"Step 4: cleared {removed} stale Step 5 state file(s); solve must be rerun.")
+
+
 def _complex_sheet_admittance(
     sigma_s: torch.Tensor,
     omega: float,
@@ -350,6 +368,19 @@ def step1_build_grid_admittance(
         sigma_flow = _component_sigma_map_from_x(mean_val, x_flow, weights)
         sigma_bg = _component_sigma_map_from_x(mean_val, x_bg, weights)
         cond_real = 0.25 * (sigma_conv + sigma_exchange + sigma_flow + sigma_bg)
+        # Enforce that the final Europa snapshot map mean matches the GUI target.
+        mean_now = float(cond_real.mean().item())
+        if mean_now > 0.0 and mean_val >= 0.0:
+            scale_mean = mean_val / mean_now
+            cond_real = cond_real * scale_mean
+            sigma_conv = sigma_conv * scale_mean
+            sigma_exchange = sigma_exchange * scale_mean
+            sigma_flow = sigma_flow * scale_mean
+            sigma_bg = sigma_bg * scale_mean
+            log(
+                f"Europa snapshot mean normalization: applied scale={scale_mean:.6g} "
+                f"to match target mean={mean_val:.3e}"
+            )
         model_components["sigma_conv_only"] = sigma_conv
         model_components["sigma_exchange_only"] = sigma_exchange
         model_components["sigma_flow_only"] = sigma_flow
@@ -585,6 +616,7 @@ def step2_build_ambient(
         }
     )
     path = _save_state("ambient.pt", state1)
+    _clear_solution_states(log)
     log(
         f"Step 4 complete. Saved ambient + B_radial to {path} "
         f"(axis={axis.upper()}, amplitude={amp_val:.3e} T, period={period_val:.6g} h)"
@@ -781,19 +813,28 @@ def step4_render_overview(label: str, log, plotter: str) -> Path:
     return out_path
 
 
-def step4_render_gradient(label: str, altitude_m: float, log, plotter: str) -> Path:
+def step4_render_gradient(label: str, altitude_m: float, log, plotter: str, gradient_fd_scheme: str) -> Path:
     payload = _load_solution(label)
     sim_out: PhasorSimulation = payload["phasor_sim"]
     grid_state = _load_state("grid_admittance.pt")
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     title = f"RSS |grad_B_emit| at alt={altitude_m/1000:.0f} km"
     save_path = FIG_DIR / f"nonuniform_grad_{int(altitude_m):d}m_{label}.png"
-    render_gradient_map(sim_out, altitude_m=altitude_m, save_path=str(save_path), title=title, faces=grid_state["faces"], plotter=plotter)
+    render_gradient_map(
+        sim_out,
+        altitude_m=altitude_m,
+        save_path=str(save_path),
+        title=title,
+        faces=grid_state["faces"],
+        plotter=plotter,
+        timing_log=log,
+        fd_scheme=gradient_fd_scheme,
+    )
     log(f"Rendered gradient map to {save_path}")
     return save_path
 
 
-def step4_render_gradient_log100(label: str, log, plotter: str) -> Path:
+def step4_render_gradient_log100(label: str, log, plotter: str, gradient_fd_scheme: str) -> Path:
     payload = _load_solution(label)
     sim_out: PhasorSimulation = payload["phasor_sim"]
     grid_state = _load_state("grid_admittance.pt")
@@ -809,6 +850,8 @@ def step4_render_gradient_log100(label: str, log, plotter: str) -> Path:
         faces=grid_state["faces"],
         plotter=plotter,
         log_scale=True,
+        timing_log=log,
+        fd_scheme=gradient_fd_scheme,
     )
     log(f"Rendered log-scale gradient map to {save_path}")
     return save_path
@@ -1191,11 +1234,12 @@ def main():
     default_lmax = "36"
     default_iter_order = "3"
     default_plotter = "matplotlib"
+    default_gradient_fd_scheme = "forward"
     default_conductivity_model = "europa_snapshot"
     default_mode_l = "10"
     default_mode_m = "2"
     default_frac_rms = "0.05"
-    default_ambient_axis = "x"
+    default_ambient_axis = "z"
     default_ambient_amplitude = "1e-6"
     default_ambient_period_hours = "9.925"
     lmax_var = tk.StringVar(value=default_lmax)
@@ -1225,6 +1269,10 @@ def main():
     plotter_var = tk.StringVar(value=default_plotter)
     tk.Radiobutton(frm, text="PyVista", variable=plotter_var, value="pyvista").grid(row=2, column=8, sticky="w")
     tk.Radiobutton(frm, text="Matplotlib", variable=plotter_var, value="matplotlib").grid(row=2, column=9, sticky="w")
+    ttk.Label(frm, text="Gradient FD").grid(row=2, column=10, sticky="e")
+    gradient_fd_var = tk.StringVar(value=default_gradient_fd_scheme)
+    tk.Radiobutton(frm, text="Forward", variable=gradient_fd_var, value="forward").grid(row=2, column=11, sticky="w")
+    tk.Radiobutton(frm, text="Central", variable=gradient_fd_var, value="central").grid(row=2, column=12, sticky="w")
 
     ttk.Label(frm, text="conductivity model").grid(row=4, column=0, sticky="w")
     conductivity_model_var = tk.StringVar(value=default_conductivity_model)
@@ -1235,7 +1283,7 @@ def main():
         frm, text="Europa snapshot", variable=conductivity_model_var, value="europa_snapshot"
     ).grid(row=4, column=2, sticky="w")
     tk.Radiobutton(
-        frm, text="Existing synthetic", variable=conductivity_model_var, value="synthetic_sh"
+        frm, text="Selected harmonic", variable=conductivity_model_var, value="synthetic_sh"
     ).grid(row=4, column=3, sticky="w")
 
     default_cfg = GridConfig(nside=1, lmax=1, radius_m=1.56e6, device="cpu")
@@ -1268,6 +1316,7 @@ def main():
         ambient_period_var.set(default_ambient_period_hours)
         iter_order_var.set(default_iter_order)
         plotter_var.set(default_plotter)
+        gradient_fd_var.set(default_gradient_fd_scheme)
         solve_mode_var.set("self_consistent")
         _update_grid_counts()
         if log_reset:
@@ -1450,7 +1499,13 @@ def main():
         justify="left",
         command=lambda: run_step_ui(
             btn_grad100,
-            lambda: step4_render_gradient(_selected_mode(), 100e3, lambda msg: _log(log_widget, msg), plotter_var.get()),
+            lambda: step4_render_gradient(
+                _selected_mode(),
+                100e3,
+                lambda msg: _log(log_widget, msg),
+                plotter_var.get(),
+                gradient_fd_var.get(),
+            ),
         ),
     )
     btn_grad100.grid(row=8, column=4, padx=4, sticky="w")
@@ -1461,7 +1516,12 @@ def main():
         justify="left",
         command=lambda: run_step_ui(
             btn_grad100_log,
-            lambda: step4_render_gradient_log100(_selected_mode(), lambda msg: _log(log_widget, msg), plotter_var.get()),
+            lambda: step4_render_gradient_log100(
+                _selected_mode(),
+                lambda msg: _log(log_widget, msg),
+                plotter_var.get(),
+                gradient_fd_var.get(),
+            ),
         ),
     )
     btn_grad100_log.grid(row=8, column=5, padx=4, sticky="w")

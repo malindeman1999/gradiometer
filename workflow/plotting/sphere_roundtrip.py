@@ -14,6 +14,9 @@ import torch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.spatial import ConvexHull
 
+DEFAULT_SPHERE_ELEV = 40.0
+DEFAULT_SPHERE_AZIM = 0.0
+
 
 def fibonacci_sphere_points(n: int, radius: float) -> torch.Tensor:
     idx = np.arange(n, dtype=np.float64) + 0.5
@@ -68,8 +71,8 @@ def sphere_image(
     symmetric: bool = False,
     vmin: float | None = None,
     vmax: float | None = None,
-    elev: float = 20.0,
-    azim: float = 30.0,
+    elev: float = DEFAULT_SPHERE_ELEV,
+    azim: float = DEFAULT_SPHERE_AZIM,
 ) -> np.ndarray:
     face_vals = _face_values_from_nodes(values, faces)
     if vmin is not None or vmax is not None:

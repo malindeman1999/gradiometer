@@ -8,15 +8,15 @@ Key notes:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-import warnings
 import math
+import time
 
 import torch
 import numpy as np
 
 from europa_model import inductance
 from europa_model.observation import evaluate_field_from_spectral
-from europa_model.transforms import sph_harm_fn
+from workflow.plotting.sphere_roundtrip import DEFAULT_SPHERE_ELEV, DEFAULT_SPHERE_AZIM
 
 if TYPE_CHECKING:  # pragma: no cover
     from workflow.data_objects.phasor_data import PhasorSimulation
@@ -70,37 +70,6 @@ def spherical_components_to_cart(Br: torch.Tensor, Btheta: torch.Tensor, Bphi: t
     return Br[..., None] * rhat + Btheta[..., None] * theta_hat + Bphi[..., None] * phi_hat
 
 
-def _sph_harm_with_derivs(positions: torch.Tensor, lmax: int, eps: float = 1e-6):
-    import numpy as np
-
-    pos_np = positions.detach().cpu().numpy()
-    x, y, z = pos_np[:, 0], pos_np[:, 1], pos_np[:, 2]
-    r = np.linalg.norm(pos_np, axis=1) + 1e-12
-    theta = np.arccos(np.clip(z / r, -1.0, 1.0))
-    phi = np.mod(np.arctan2(y, x), 2 * np.pi)
-    n = pos_np.shape[0]
-    Y = np.zeros((lmax + 1, 2 * lmax + 1, n), dtype=np.complex128)
-    dY = np.zeros_like(Y)
-    d2Y = np.zeros_like(Y)
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=DeprecationWarning, message="`scipy.special.sph_harm` is deprecated")
-        for l in range(lmax + 1):
-            m_vals = np.arange(-l, l + 1)
-            for idx, m in enumerate(m_vals):
-                base = sph_harm_fn(m, l, phi, theta)
-                plus = sph_harm_fn(m, l, phi, theta + eps)
-                minus = sph_harm_fn(m, l, phi, theta - eps)
-                dtheta = (plus - minus) / (2 * eps)
-                d2theta = (plus - 2 * base + minus) / (eps ** 2)
-                Y[l, lmax - l + idx] = base
-                dY[l, lmax - l + idx] = dtheta
-                d2Y[l, lmax - l + idx] = d2theta
-    Y_np = np.transpose(Y, (2, 0, 1))
-    dY_np = np.transpose(dY, (2, 0, 1))
-    d2Y_np = np.transpose(d2Y, (2, 0, 1))
-    return theta, phi, np.sin(theta), Y_np, dY_np, d2Y_np
-
-
 def finite_diff_gradients_cartesian_closed_form(
     J_tor: torch.Tensor, radius: float, positions: torch.Tensor, delta: float = 1.0
 ) -> torch.Tensor:
@@ -110,18 +79,52 @@ def finite_diff_gradients_cartesian_closed_form(
     """
     device = positions.device
     dtype = positions.dtype
+    n = positions.shape[0]
     deltas = torch.eye(3, device=device, dtype=dtype) * delta
-    grads = []
+
+    shifted = []
     for axis in range(3):
         shift = deltas[axis]
-        pos_plus = positions + shift
-        pos_minus = positions - shift
-        Br_p, Bth_p, Bph_p = toroidal_field_spherical(J_tor, radius, pos_plus)
-        Br_m, Bth_m, Bph_m = toroidal_field_spherical(J_tor, radius, pos_minus)
-        Bp_cart = spherical_components_to_cart(Br_p, Bth_p, Bph_p, pos_plus)
-        Bm_cart = spherical_components_to_cart(Br_m, Bth_m, Bph_m, pos_minus)
-        grad_axis = (Bp_cart - Bm_cart) / (2.0 * delta)
-        grads.append(grad_axis)
+        shifted.append(positions + shift)
+        shifted.append(positions - shift)
+    shifted_all = torch.cat(shifted, dim=0)  # [6N, 3]
+
+    Br, Bth, Bph = toroidal_field_spherical(J_tor, radius, shifted_all)
+    B_cart_all = spherical_components_to_cart(Br, Bth, Bph, shifted_all).reshape(3, 2, n, 3)
+
+    grads = []
+    for axis in range(3):
+        Bp_cart = B_cart_all[axis, 0]
+        Bm_cart = B_cart_all[axis, 1]
+        grads.append((Bp_cart - Bm_cart) / (2.0 * delta))
+    return torch.stack(grads, dim=-1)  # [N,3,3]
+
+
+def finite_diff_gradients_cartesian_closed_form_forward(
+    J_tor: torch.Tensor, radius: float, positions: torch.Tensor, delta: float = 1.0
+) -> torch.Tensor:
+    """
+    Forward differences using a shared base point:
+    dB_i/dx_j ~= (B_i(x + delta e_j) - B_i(x)) / delta
+    Returns [N,3,3] with dB_i/dx_j in Cartesian coordinates.
+    """
+    device = positions.device
+    dtype = positions.dtype
+    n = positions.shape[0]
+    deltas = torch.eye(3, device=device, dtype=dtype) * delta
+
+    shifted = [positions]
+    for axis in range(3):
+        shifted.append(positions + deltas[axis])
+    shifted_all = torch.cat(shifted, dim=0)  # [4N, 3]
+
+    Br, Bth, Bph = toroidal_field_spherical(J_tor, radius, shifted_all)
+    B_cart_all = spherical_components_to_cart(Br, Bth, Bph, shifted_all).reshape(4, n, 3)
+    B0 = B_cart_all[0]
+    grads = []
+    for axis in range(3):
+        Bp = B_cart_all[axis + 1]
+        grads.append((Bp - B0) / delta)
     return torch.stack(grads, dim=-1)  # [N,3,3]
 
 
@@ -138,16 +141,52 @@ def finite_diff_gradients_cartesian_from_spectral(
     """
     device = positions.device
     dtype = positions.dtype
+    n = positions.shape[0]
     deltas = torch.eye(3, device=device, dtype=dtype) * delta
-    grads = []
+
+    shifted = []
     for axis in range(3):
         shift = deltas[axis]
-        pos_plus = positions + shift
-        pos_minus = positions - shift
-        Bp_cart = evaluate_field_from_spectral(B_tor, B_pol, B_rad, pos_plus)
-        Bm_cart = evaluate_field_from_spectral(B_tor, B_pol, B_rad, pos_minus)
-        grad_axis = (Bp_cart - Bm_cart) / (2.0 * delta)
-        grads.append(grad_axis)
+        shifted.append(positions + shift)
+        shifted.append(positions - shift)
+    shifted_all = torch.cat(shifted, dim=0)  # [6N, 3]
+
+    B_cart_all = evaluate_field_from_spectral(B_tor, B_pol, B_rad, shifted_all).reshape(3, 2, n, 3)
+    grads = []
+    for axis in range(3):
+        Bp_cart = B_cart_all[axis, 0]
+        Bm_cart = B_cart_all[axis, 1]
+        grads.append((Bp_cart - Bm_cart) / (2.0 * delta))
+    return torch.stack(grads, dim=-1)  # [N,3,3]
+
+
+def finite_diff_gradients_cartesian_from_spectral_forward(
+    B_tor: torch.Tensor,
+    B_pol: torch.Tensor,
+    B_rad: torch.Tensor,
+    positions: torch.Tensor,
+    delta: float = 1.0,
+) -> torch.Tensor:
+    """
+    Forward differences from spectral field evaluation using a shared base point.
+    Returns [N,3,3] with dB_i/dx_j in Cartesian coordinates.
+    """
+    device = positions.device
+    dtype = positions.dtype
+    n = positions.shape[0]
+    deltas = torch.eye(3, device=device, dtype=dtype) * delta
+
+    shifted = [positions]
+    for axis in range(3):
+        shifted.append(positions + deltas[axis])
+    shifted_all = torch.cat(shifted, dim=0)  # [4N, 3]
+
+    B_cart_all = evaluate_field_from_spectral(B_tor, B_pol, B_rad, shifted_all).reshape(4, n, 3)
+    B0 = B_cart_all[0]
+    grads = []
+    for axis in range(3):
+        Bp = B_cart_all[axis + 1]
+        grads.append((Bp - B0) / delta)
     return torch.stack(grads, dim=-1)  # [N,3,3]
 
 
@@ -202,119 +241,23 @@ def finite_diff_gradients_spherical(
     return torch.stack(grads, dim=-1)  # [N,3,3]
 
 
-def _toroidal_field_and_gradients_spherical_core(
-    J_tor: torch.Tensor,
-    radius: float,
-    positions: torch.Tensor,
-    theta_fd_step: float = 1e-6,
-):
-    import numpy as np
-
-    device = positions.device
-    lmax = J_tor.shape[-2] - 1
-    if J_tor.shape[-1] != 2 * lmax + 1:
-        raise ValueError(f"Expected J_tor shape (lmax+1, 2*lmax+1); got {tuple(J_tor.shape)}")
-
-    pos_np = positions.detach().cpu().numpy()
-    r = np.linalg.norm(pos_np, axis=1)
-    r_safe = np.where(r == 0.0, 1e-30, r)
-    theta = np.arccos(np.clip(pos_np[:, 2] / r_safe, -1.0, 1.0))
-    phi = np.arctan2(pos_np[:, 1], pos_np[:, 0])
-    sin_th = np.sin(theta)
-    sin_th_safe = np.where(sin_th == 0.0, 1e-30, sin_th)
-    cos_th = np.cos(theta)
-
-    _, _, _, Y, dY, d2Y = _sph_harm_with_derivs(positions, lmax, eps=theta_fd_step)
-
-    ls = np.arange(0, lmax + 1, dtype=np.float64).reshape(1, lmax + 1, 1)
-    ms = np.arange(-lmax, lmax + 1, dtype=np.float64).reshape(1, 1, 2 * lmax + 1)
-
-    R = float(radius)
-    r_ratio = (R / r_safe).reshape(-1, 1, 1)
-    F_lm = np.power(r_ratio, ls + 2.0)
-    F_lm = np.broadcast_to(F_lm, (r.shape[0], lmax + 1, 2 * lmax + 1)).astype(np.complex128)
-
-    MU0_val = float(inductance.MU0)
-    ell = ls * (ls + 1.0)
-    two_l1 = 2.0 * ls + 1.0
-    ell_safe = np.where(ell == 0.0, 1.0, ell)
-
-    A_l = (-MU0_val / (two_l1 * ell_safe)).astype(np.complex128)
-    C_l = (MU0_val * ls / two_l1).astype(np.complex128)
-    A_lm = np.broadcast_to(A_l, (r.shape[0], lmax + 1, 2 * lmax + 1))
-    C_lm = np.broadcast_to(C_l, (r.shape[0], lmax + 1, 2 * lmax + 1))
-
-    J = np.asarray(J_tor.detach().cpu().numpy(), dtype=np.complex128)
-    J_lm = np.broadcast_to(J, (r.shape[0],) + J.shape)
-
-    Br = np.sum(A_lm * J_lm * F_lm * Y, axis=(-2, -1))
-    Btheta = np.sum(C_lm * J_lm * F_lm * dY, axis=(-2, -1))
-    im_over_sin = 1j * ms / sin_th_safe[:, None, None]
-    Bphi = np.sum(C_lm * J_lm * F_lm * (im_over_sin * Y), axis=(-2, -1))
-
-    dF_dr = (-(ls + 2.0) / r_safe[:, None, None]) * F_lm
-
-    dBr_dr = np.sum(A_lm * J_lm * dF_dr * Y, axis=(-2, -1))
-    dBr_dth = np.sum(A_lm * J_lm * F_lm * dY, axis=(-2, -1))
-    dBr_dph = np.sum(A_lm * J_lm * F_lm * (1j * ms * Y), axis=(-2, -1))
-    grad_Br = np.stack([dBr_dr, dBr_dth / r_safe, dBr_dph / (r_safe * sin_th_safe)], axis=-1)
-
-    dBth_dr = np.sum(C_lm * J_lm * dF_dr * dY, axis=(-2, -1))
-    dBth_dth = np.sum(C_lm * J_lm * F_lm * d2Y, axis=(-2, -1))
-    dBth_dph = np.sum(C_lm * J_lm * F_lm * (1j * ms * dY), axis=(-2, -1))
-    grad_Btheta = np.stack([dBth_dr, dBth_dth / r_safe, dBth_dph / (r_safe * sin_th_safe)], axis=-1)
-
-    term_theta = (1.0 / sin_th_safe)[:, None, None] * dY - (cos_th / (sin_th_safe ** 2))[:, None, None] * Y
-    d_dth_im_over_sin_Y = (1j * ms) * term_theta
-    m2_over_sin = (-(ms * ms) / sin_th_safe[:, None, None])
-
-    dBph_dr = np.sum(C_lm * J_lm * dF_dr * (im_over_sin * Y), axis=(-2, -1))
-    dBph_dth = np.sum(C_lm * J_lm * F_lm * d_dth_im_over_sin_Y, axis=(-2, -1))
-    dBph_dph = np.sum(C_lm * J_lm * F_lm * (m2_over_sin * Y), axis=(-2, -1))
-    grad_Bphi = np.stack([dBph_dr, dBph_dth / r_safe, dBph_dph / (r_safe * sin_th_safe)], axis=-1)
-
-    def _to_tensor(arr):
-        return torch.as_tensor(arr, device=device, dtype=torch.complex128)
-
-    return (
-        _to_tensor(Br),
-        _to_tensor(Btheta),
-        _to_tensor(Bphi),
-        _to_tensor(grad_Br),
-        _to_tensor(grad_Btheta),
-        _to_tensor(grad_Bphi),
-    )
-
-
 def toroidal_field_spherical(
     J_tor: torch.Tensor,
     radius: float,
     positions: torch.Tensor,
     theta_fd_step: float = 1e-6,
 ):
-    Br, Btheta, Bphi, *_ = _toroidal_field_and_gradients_spherical_core(J_tor, radius, positions, theta_fd_step)
+    _ = theta_fd_step
+    zeros = torch.zeros_like(J_tor)
+    B_tor, B_pol, B_rad = inductance.spectral_b_from_surface_currents(J_tor, zeros, radius=radius)
+    B_cart = evaluate_field_from_spectral(B_tor, B_pol, B_rad, positions)
+    r = torch.linalg.norm(positions, dim=-1)
+    r_safe = torch.where(r == 0, torch.full_like(r, 1e-30), r)
+    theta = torch.acos(torch.clamp(positions[..., 2] / r_safe, -1.0, 1.0))
+    phi = torch.atan2(positions[..., 1], positions[..., 0])
+    B_sph = _cart_to_sph_components(B_cart, theta, phi)
+    Br, Btheta, Bphi = B_sph[..., 0], B_sph[..., 1], B_sph[..., 2]
     return Br, Btheta, Bphi
-
-
-def toroidal_gradients_spherical(
-    J_tor: torch.Tensor,
-    radius: float,
-    positions: torch.Tensor,
-    theta_fd_step: float = 1e-6,
-):
-    *_, grad_Br, grad_Btheta, grad_Bphi = _toroidal_field_and_gradients_spherical_core(
-        J_tor, radius, positions, theta_fd_step
-    )
-    return grad_Br, grad_Btheta, grad_Bphi
-
-
-def toroidal_field_and_gradients_spherical(
-    J_tor: torch.Tensor,
-    radius: float,
-    positions: torch.Tensor,
-    theta_fd_step: float = 1e-6,
-):
-    return _toroidal_field_and_gradients_spherical_core(J_tor, radius, positions, theta_fd_step)
 
 
 def rss_gradient_from_emit(
@@ -324,6 +267,7 @@ def rss_gradient_from_emit(
     *,
     fd_delta_m: float = 1000.0,
     method: str = "cartesian_spectral",
+    fd_scheme: str = "forward",
 ) -> torch.Tensor:
     _ = sim.radius_m if obs_radius is None else float(obs_radius)
     K_tor = sim.K_toroidal
@@ -331,36 +275,49 @@ def rss_gradient_from_emit(
         raise ValueError("K_toroidal is required to evaluate emitted field at new radius.")
 
     method_key = str(method).strip().lower()
+    fd_scheme_key = str(fd_scheme).strip().lower()
+    if fd_scheme_key not in {"forward", "central"}:
+        raise ValueError(f"Unknown finite-difference scheme: {fd_scheme}")
     delta = float(max(1e-6, fd_delta_m))
     source_radius = float(sim.radius_m)
     if method_key == "cartesian_spectral":
         if sim.B_tor_emit is None or sim.B_pol_emit is None or sim.B_rad_emit is None:
             method_key = "cartesian_closed_form"
         else:
-            grad_cart = finite_diff_gradients_cartesian_from_spectral(
-                sim.B_tor_emit,
-                sim.B_pol_emit,
-                sim.B_rad_emit,
-                positions=positions,
-                delta=delta,
-            )
+            if fd_scheme_key == "forward":
+                grad_cart = finite_diff_gradients_cartesian_from_spectral_forward(
+                    sim.B_tor_emit,
+                    sim.B_pol_emit,
+                    sim.B_rad_emit,
+                    positions=positions,
+                    delta=delta,
+                )
+            else:
+                grad_cart = finite_diff_gradients_cartesian_from_spectral(
+                    sim.B_tor_emit,
+                    sim.B_pol_emit,
+                    sim.B_rad_emit,
+                    positions=positions,
+                    delta=delta,
+                )
             return torch.linalg.norm(grad_cart, dim=(1, 2))
 
     if method_key == "cartesian_closed_form":
-        grad_cart = finite_diff_gradients_cartesian_closed_form(
-            K_tor,
-            radius=source_radius,
-            positions=positions,
-            delta=delta,
-        )
+        if fd_scheme_key == "forward":
+            grad_cart = finite_diff_gradients_cartesian_closed_form_forward(
+                K_tor,
+                radius=source_radius,
+                positions=positions,
+                delta=delta,
+            )
+        else:
+            grad_cart = finite_diff_gradients_cartesian_closed_form(
+                K_tor,
+                radius=source_radius,
+                positions=positions,
+                delta=delta,
+            )
         return torch.linalg.norm(grad_cart, dim=(1, 2))
-
-    if method_key == "spherical_analytic":
-        _, _, _, grad_Br, grad_Btheta, grad_Bphi = toroidal_field_and_gradients_spherical(
-            K_tor, radius=source_radius, positions=positions
-        )
-        grad_tensor = torch.stack([grad_Br, grad_Btheta, grad_Bphi], dim=1)  # [N,3,3]
-        return torch.linalg.norm(grad_tensor, dim=(1, 2))
 
     raise ValueError(f"Unknown gradient RSS method: {method}")
 
@@ -414,15 +371,11 @@ def gradient_sanity_check(
     R_source = float(sim.radius_m)
     J_tor = sim.K_toroidal.to(device=device)
 
-    _, _, _, grad_Br, grad_Btheta, grad_Bphi = toroidal_field_and_gradients_spherical(
-        J_tor, radius=R_source, positions=positions, theta_fd_step=theta_fd_step
-    )
-    rss_A = torch.linalg.norm(torch.stack([grad_Br, grad_Btheta, grad_Bphi], dim=1), dim=(1, 2))
-
+    _ = theta_fd_step
     grad_sph_fd = finite_diff_gradients_spherical(
         J_tor, R_source, positions, delta_r=delta_r, delta_theta=delta_theta, delta_phi=delta_phi
     )
-    rss_B = torch.linalg.norm(grad_sph_fd, dim=(1, 2))
+    rss_sph_fd = torch.linalg.norm(grad_sph_fd, dim=(1, 2))
 
     grad_cart_fd = finite_diff_gradients_cartesian_closed_form(J_tor, R_source, positions, delta=delta_cart_m)
     rss_cart_fd = torch.linalg.norm(grad_cart_fd, dim=(1, 2))
@@ -433,7 +386,7 @@ def gradient_sanity_check(
         rss_C = rss_gradient_cartesian_autograd(J_tor, radius=R_source, positions=positions)
         rel_BC_cart = torch.abs(rss_cart_fd - rss_C) / torch.maximum(torch.abs(rss_C), eps)
 
-    rel_AB = torch.abs(rss_A - rss_B) / torch.maximum(torch.abs(rss_B), eps)
+    rel_AB = torch.abs(rss_cart_fd - rss_sph_fd) / torch.maximum(torch.abs(rss_sph_fd), eps)
 
     def _summary(x: torch.Tensor):
         x = x.detach().cpu()
@@ -445,14 +398,13 @@ def gradient_sanity_check(
         }
 
     out = {
-        "rss_A_analytic_spherical": rss_A.detach().cpu(),
-        "rss_B_fd_spherical": rss_B.detach().cpu(),
+        "rss_fd_spherical": rss_sph_fd.detach().cpu(),
         "rss_fd_cartesian": rss_cart_fd.detach().cpu(),
         "rss_C_autograd_cartesian": rss_C.detach().cpu() if rss_C is not None else None,
-        "rel_AB_vs_B": rel_AB.detach().cpu(),
+        "rel_cart_vs_sph_fd": rel_AB.detach().cpu(),
         "rel_BC_cart_vs_C": rel_BC_cart.detach().cpu() if rel_BC_cart is not None else None,
         "summary": {
-            "rel_AB_vs_B": _summary(rel_AB),
+            "rel_cart_vs_sph_fd": _summary(rel_AB),
             "rel_BC_cart_vs_C": _summary(rel_BC_cart) if rel_BC_cart is not None else None,
         },
         "params": {
@@ -481,7 +433,7 @@ def gradient_sanity_check(
         for k, v in out["params"].items():
             print(f"{k}: {v}")
         print("\nRelative errors (RSS gradients):")
-        print("A vs B (relative to B):", out["summary"]["rel_AB_vs_B"])
+        print("FD Cartesian vs FD spherical (relative to spherical):", out["summary"]["rel_cart_vs_sph_fd"])
         if rel_BC_cart is not None:
             print("FD Cartesian vs autograd Cartesian:", out["summary"]["rel_BC_cart_vs_C"])
 
@@ -497,14 +449,25 @@ def render_gradient_map(
     plotter: str = "pyvista",
     subdivisions: int = 0,
     log_scale: bool = False,
+    timing_log=None,
+    fd_scheme: str = "forward",
 ) -> None:
     import matplotlib.pyplot as plt
-    from workflow.plotting.sphere_roundtrip import sphere_image
 
     radius = sim.radius_m + altitude_m
     scale = radius / sim.radius_m
     positions = (sim.grid_positions * scale).to(dtype=torch.float64)
-    rss = rss_gradient_from_emit(sim, positions, obs_radius=radius).cpu().numpy()
+    t_grad0 = time.perf_counter()
+    rss = rss_gradient_from_emit(sim, positions, obs_radius=radius, fd_scheme=fd_scheme).cpu().numpy()
+    grad_dt = time.perf_counter() - t_grad0
+    if timing_log is not None:
+        try:
+            timing_log(
+                f"Gradient compute only: {grad_dt:.2f}s "
+                f"(nodes={positions.shape[0]}, method=cartesian_spectral, scheme={fd_scheme})"
+            )
+        except Exception:
+            pass
 
     pts = positions.detach().cpu().numpy()
     if faces is None:
@@ -587,8 +550,8 @@ def render_gradient_map(
     ]
     cax = fig_save.add_subplot(grid[0, 2])
     for ax, view_label, azim in (
-        (axes_save[0], "Front", 0),
-        (axes_save[1], "Back", 180),
+        (axes_save[0], "Front", DEFAULT_SPHERE_AZIM),
+        (axes_save[1], "Back", DEFAULT_SPHERE_AZIM + 180.0),
     ):
         collection = Poly3DCollection(
             tri_verts,
@@ -604,7 +567,7 @@ def render_gradient_map(
         ax.set_box_aspect([1, 1, 1])
         ax.set_axis_off()
         ax.set_title(view_label, pad=8)
-        ax.view_init(elev=0, azim=azim)
+        ax.view_init(elev=DEFAULT_SPHERE_ELEV, azim=azim)
     fig_save.suptitle(title, y=0.98)
     mappable = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     mappable.set_array(face_vals)
@@ -635,6 +598,7 @@ def render_gradient_map(
         ax.set_box_aspect([1, 1, 1])
         ax.set_axis_off()
         ax.set_title(title, pad=12)
+        ax.view_init(elev=DEFAULT_SPHERE_ELEV, azim=DEFAULT_SPHERE_AZIM)
         fig_show.colorbar(
             mappable,
             ax=ax,
@@ -742,8 +706,8 @@ def render_b_magnitude_map(
     ]
     cax = fig_save.add_subplot(grid[0, 2])
     for ax, view_label, azim in (
-        (axes_save[0], "Front", 0),
-        (axes_save[1], "Back", 180),
+        (axes_save[0], "Front", DEFAULT_SPHERE_AZIM),
+        (axes_save[1], "Back", DEFAULT_SPHERE_AZIM + 180.0),
     ):
         collection = Poly3DCollection(
             tri_verts,
@@ -759,7 +723,7 @@ def render_b_magnitude_map(
         ax.set_box_aspect([1, 1, 1])
         ax.set_axis_off()
         ax.set_title(view_label, pad=8)
-        ax.view_init(elev=0, azim=azim)
+        ax.view_init(elev=DEFAULT_SPHERE_ELEV, azim=azim)
     fig_save.suptitle(title, y=0.98)
     mappable = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     mappable.set_array(face_vals)
@@ -793,6 +757,7 @@ def render_b_magnitude_map(
         ax.set_box_aspect([1, 1, 1])
         ax.set_axis_off()
         ax.set_title(title, pad=12)
+        ax.view_init(elev=DEFAULT_SPHERE_ELEV, azim=DEFAULT_SPHERE_AZIM)
         cb = fig_show.colorbar(
             mappable,
             ax=ax,

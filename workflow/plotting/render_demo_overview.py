@@ -14,7 +14,7 @@ from scipy.spatial import ConvexHull
 from workflow.data_objects.phasor_data import PhasorSimulation
 from workflow.plotting.plot_demo_harmonics import _flatten as _flatten_lm
 from workflow.plotting.render_phasor_maps import _scalar_from_sh, _toroidal_vec_mag
-from workflow.plotting.sphere_roundtrip import sphere_image
+from workflow.plotting.sphere_roundtrip import sphere_image, DEFAULT_SPHERE_ELEV, DEFAULT_SPHERE_AZIM
 from europa_model import transforms
 
 
@@ -34,8 +34,8 @@ def render_demo_overview(
     data_path: str = "demo_currents.pt",
     subdivisions: int = 0,
     stride: int = 1,
-    elev: float = 20.0,
-    azim: float = 30.0,
+    elev: float = DEFAULT_SPHERE_ELEV,
+    azim: float = DEFAULT_SPHERE_AZIM,
     save_path: Optional[str] = "demo_currents_overview.png",
     show: bool = True,
     eps: float = 1e-15,
@@ -129,6 +129,8 @@ def render_demo_overview(
                 plotter=plotter,
                 cmap=cmap,
                 symmetric=symmetric,
+                elev=elev,
+                azim=azim,
             )
             ax_sph.imshow(img)
             ax_sph.set_title(f"{field_title} ({unit})")

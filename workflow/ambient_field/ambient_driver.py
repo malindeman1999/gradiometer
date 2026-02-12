@@ -51,9 +51,11 @@ def build_ambient_driver_x(
     ambient_cfg, _, period_sec = _base_config(period_hours, amplitude_t, phase_rad)
     lmax = grid_cfg.lmax
     B_radial_spec = torch.zeros((lmax + 1, 2 * lmax + 1), device=grid_cfg.device, dtype=torch.complex128)
-    # Combination gives a real +X-directed field on the sphere
-    B_radial_spec[1, lmax - 1] = amplitude_t / 2.0
-    B_radial_spec[1, lmax + 1] = -amplitude_t / 2.0
+    # Match axis amplitude with the m=0 (Z) convention:
+    # each m=±1 term carries 1/sqrt(2) of the Z coefficient magnitude.
+    coeff = amplitude_t / math.sqrt(2.0)
+    B_radial_spec[1, lmax - 1] = coeff
+    B_radial_spec[1, lmax + 1] = -coeff
     return ambient_cfg, B_radial_spec, period_sec
 
 
@@ -72,7 +74,8 @@ def build_ambient_driver_y(
     lmax = grid_cfg.lmax
     B_radial_spec = torch.zeros((lmax + 1, 2 * lmax + 1), device=grid_cfg.device, dtype=torch.complex128)
     # Imaginary coefficients yield a real +Y-directed field
-    coeff = amplitude_t / (2.0j)
+    # Same normalization as +X, with the phase shift that yields +Y.
+    coeff = amplitude_t / (math.sqrt(2.0) * 1.0j)
     B_radial_spec[1, lmax - 1] = coeff
     B_radial_spec[1, lmax + 1] = coeff
     return ambient_cfg, B_radial_spec, period_sec

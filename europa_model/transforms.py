@@ -31,8 +31,8 @@ def _angles_from_positions(positions: torch.Tensor) -> Tuple[np.ndarray, np.ndar
     return theta, phi
 
 
-def _get_scalar_matrices(positions: torch.Tensor, lmax: int, weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build weighted spherical harmonic matrix and its pseudoinverse for given nodes."""
+def _build_scalar_design_matrix(positions: torch.Tensor, lmax: int) -> np.ndarray:
+    """Build scalar SH design matrix Y [N_nodes, (lmax+1)^2] on CPU (numpy)."""
     theta, phi = _angles_from_positions(positions)
     n_nodes = positions.shape[0]
     n_coeff = (lmax + 1) ** 2
@@ -43,6 +43,12 @@ def _get_scalar_matrices(positions: torch.Tensor, lmax: int, weights: torch.Tens
         # sph_harm signature: sph_harm(m, l, phi, theta) with phi=azimuth, theta=polar
         Y[:, col:col + (2 * l + 1)] = np.column_stack([sph_harm_fn(m, l, phi, theta) for m in m_vals])
         col += 2 * l + 1
+    return Y
+
+
+def _get_scalar_matrices(positions: torch.Tensor, lmax: int, weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build weighted spherical harmonic matrix and its pseudoinverse for given nodes."""
+    Y = _build_scalar_design_matrix(positions, lmax)
     w = weights.detach().cpu().numpy()
     W_sqrt = np.sqrt(w)[:, None]
     Y_w = Y * W_sqrt
@@ -52,6 +58,20 @@ def _get_scalar_matrices(positions: torch.Tensor, lmax: int, weights: torch.Tens
     # Preserve a 1D shape even for a single node (avoids scalar squeeze issues downstream).
     W_sqrt_torch = torch.from_numpy(W_sqrt.reshape(-1)).to(device=positions.device, dtype=torch.float64)
     return Y_w_torch, pinv_torch, W_sqrt_torch
+
+
+def _get_scalar_eval_matrices(positions: torch.Tensor, lmax: int, weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build only the weighted SH matrix needed for inverse evaluation.
+    Avoids the expensive pseudoinverse used by forward projection.
+    """
+    Y = _build_scalar_design_matrix(positions, lmax)
+    w = weights.detach().cpu().numpy()
+    W_sqrt = np.sqrt(w)[:, None]
+    Y_w = Y * W_sqrt
+    Y_w_torch = torch.from_numpy(Y_w).to(device=positions.device)
+    W_sqrt_torch = torch.from_numpy(W_sqrt.reshape(-1)).to(device=positions.device, dtype=torch.float64)
+    return Y_w_torch, W_sqrt_torch
 
 
 def _pad_coeffs(coeffs_flat: torch.Tensor, lmax: int, template_shape) -> torch.Tensor:
@@ -98,7 +118,7 @@ def sh_forward(grid_values: torch.Tensor, positions: torch.Tensor, lmax: int, we
 def sh_inverse(coeffs: torch.Tensor, positions: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """Reconstruct scalar values on grid from SH coefficients (complex-aware)."""
     lmax = coeffs.shape[-2] - 1
-    Y_w, _, w_sqrt = _get_scalar_matrices(positions, lmax, weights)
+    Y_w, w_sqrt = _get_scalar_eval_matrices(positions, lmax, weights)
     n_nodes = positions.shape[0]
     coeffs_flat = _unpad_coeffs(coeffs)
     coeffs_flat = coeffs_flat.to(dtype=Y_w.dtype)
