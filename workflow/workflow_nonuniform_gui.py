@@ -20,6 +20,8 @@ from datetime import datetime
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib import cm, colors
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from workflow.ambient_field.ambient_driver import (
     build_ambient_driver_x,
@@ -34,7 +36,13 @@ from europa_model.solver_variants.solver_variant_precomputed import (
     _build_mixing_matrix_precomputed_sparse,
 )
 from europa_model import inductance
-from europa_model.gradient_utils import render_gradient_map, render_b_magnitude_map
+from europa_model.gradient_utils import (
+    render_gradient_map,
+    render_b_magnitude_map,
+    rss_gradient_from_emit,
+    toroidal_field_spherical,
+)
+from europa_model.observation import evaluate_field_from_spectral
 from workflow.plotting.render_demo_overview import render_demo_overview
 from workflow.plotting.sphere_roundtrip import build_roundtrip_grid, sphere_image
 from gaunt.assemble_gaunt_checkpoints import assemble_in_memory
@@ -46,6 +54,7 @@ STATE_DIR = BASE_RUN_DIR
 FIG_DIR = BASE_RUN_DIR / "figures"
 LOG_PATH = STATE_DIR / "log.txt"
 GAUNT_CACHE = Path("gaunt/data/gaunt_cache_wigxjpf")
+STEP6_CUBE_HALF_M = 2.0e6  # Display/sample cube extent: +/-2 Mm
 
 
 def _log(text_widget: tk.Text, msg: str) -> None:
@@ -277,6 +286,137 @@ def _clear_solution_states(log) -> None:
             removed += 1
     if removed > 0:
         log(f"Step 4: cleared {removed} stale Step 5 state file(s); solve must be rerun.")
+    _clear_overview_cache(log, reason="upstream Step 4 changes")
+    _clear_step4_field_cache(log, reason="upstream Step 4 changes")
+    _clear_step6_field_cache(log, reason="upstream Step 4 changes")
+
+
+def _clear_overview_cache(log, reason: str | None = None, label: str | None = None) -> None:
+    pattern = "overview_cache_*.pt" if label is None else f"overview_cache_{label}.pt"
+    removed = 0
+    for p in STATE_DIR.glob(pattern):
+        if p.is_file():
+            p.unlink()
+            removed += 1
+    if removed > 0:
+        suffix = f" ({reason})" if reason else ""
+        log(f"Cleared {removed} overview cache file(s){suffix}.")
+
+
+def _clear_step4_field_cache(log, reason: str | None = None, label: str | None = None) -> None:
+    pattern = "step4_field_cache_*.pt" if label is None else f"step4_field_cache_{label}_*.pt"
+    removed = 0
+    for p in STATE_DIR.glob(pattern):
+        if p.is_file():
+            p.unlink()
+            removed += 1
+    if removed > 0:
+        suffix = f" ({reason})" if reason else ""
+        log(f"Cleared {removed} Step 4 field cache file(s){suffix}.")
+
+
+def _clear_step6_field_cache(log, reason: str | None = None, label: str | None = None) -> None:
+    patterns = (
+        ["step6_field_phasors_*.pt", "step6_gradient_cache_*.pt"]
+        if label is None
+        else [f"step6_field_phasors_{label}_*.pt", f"step6_gradient_cache_{label}_*.pt"]
+    )
+    removed = 0
+    for pattern in patterns:
+        for p in STATE_DIR.glob(pattern):
+            if p.is_file():
+                p.unlink()
+                removed += 1
+    if removed > 0:
+        suffix = f" ({reason})" if reason else ""
+        log(f"Cleared {removed} Step 6 cache file(s){suffix}.")
+
+
+def _state_file_signature(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return int(st.st_mtime_ns), int(st.st_size)
+
+
+def _step4_dependency_signature(label: str) -> dict[str, tuple[int, int]]:
+    deps = {
+        "grid_admittance.pt": _state_file_signature(STATE_DIR / "grid_admittance.pt"),
+        "ambient.pt": _state_file_signature(STATE_DIR / "ambient.pt"),
+        f"solution_{label}.pt": _state_file_signature(STATE_DIR / f"solution_{label}.pt"),
+    }
+    return deps
+
+
+def _step4_gradient_cache_name(label: str, altitude_m: float, fd_scheme: str) -> str:
+    alt_key = int(round(float(altitude_m)))
+    fd_key = str(fd_scheme or "forward").strip().lower()
+    return f"step4_field_cache_{label}_gradient_{alt_key}m_{fd_key}.pt"
+
+
+def _step4_bmag_cache_name(label: str, altitude_m: float) -> str:
+    alt_key = int(round(float(altitude_m)))
+    return f"step4_field_cache_{label}_bmag_{alt_key}m.pt"
+
+
+def _step6_field_cache_name(label: str, field_mode: str, n_edge: int) -> str:
+    mode = str(field_mode).strip().lower()
+    return f"step6_field_phasors_{label}_{mode}_{int(n_edge)}edge.pt"
+
+
+def _step6_gradient_cache_name(label: str, field_mode: str, altitude_m: float, fd_scheme: str) -> str:
+    mode = str(field_mode).strip().lower()
+    alt_key = int(round(float(altitude_m)))
+    fd_key = str(fd_scheme or "forward").strip().lower()
+    return f"step6_gradient_cache_{label}_{mode}_{alt_key}m_{fd_key}.pt"
+
+
+def _latest_step4_gradient_altitude_m(label: str, fd_scheme: str) -> float:
+    fd_key = str(fd_scheme or "forward").strip().lower()
+    pattern = f"step4_field_cache_{label}_gradient_*m_{fd_key}.pt"
+    latest_path = None
+    latest_mtime = -1.0
+    for p in STATE_DIR.glob(pattern):
+        if p.is_file():
+            mt = p.stat().st_mtime
+            if mt > latest_mtime:
+                latest_mtime = mt
+                latest_path = p
+    if latest_path is None:
+        return 100e3
+    stem = latest_path.stem
+    token = "_gradient_"
+    i0 = stem.find(token)
+    if i0 < 0:
+        return 100e3
+    tail = stem[i0 + len(token):]
+    i1 = tail.find("m_")
+    if i1 < 0:
+        return 100e3
+    try:
+        return float(int(tail[:i1]))
+    except Exception:
+        return 100e3
+
+
+def _load_latest_step4_gradient_cache(label: str, fd_scheme: str) -> dict:
+    fd_key = str(fd_scheme or "forward").strip().lower()
+    pattern = f"step4_field_cache_{label}_gradient_*m_{fd_key}.pt"
+    latest_path = None
+    latest_mtime = -1.0
+    for p in STATE_DIR.glob(pattern):
+        if p.is_file():
+            mt = p.stat().st_mtime
+            if mt > latest_mtime:
+                latest_mtime = mt
+                latest_path = p
+    if latest_path is None:
+        raise RuntimeError(
+            f"No cached gradient data found for label={label}, fd={fd_key}. "
+            "Run a Step 5 gradient plot first."
+        )
+    data = _load_state(latest_path.name)
+    if not isinstance(data, dict) or "positions" not in data or "rss" not in data:
+        raise RuntimeError(f"Gradient cache format invalid: {latest_path}")
+    return data
 
 
 def _complex_sheet_admittance(
@@ -317,6 +457,9 @@ def step1_build_grid_admittance(
     conductivity_model: str,
     log,
 ) -> Path:
+    _clear_overview_cache(log, reason="Step 2 grid/admittance rebuild")
+    _clear_step4_field_cache(log, reason="Step 2 grid/admittance rebuild")
+    _clear_step6_field_cache(log, reason="Step 2 grid/admittance rebuild")
     lmax = max(1, int(lmax))
     grid_cfg = GridConfig(nside=_node_count_from_lmax(lmax), lmax=lmax, radius_m=1.56e6, device="cpu")
     grid = build_roundtrip_grid(lmax=lmax, radius_m=grid_cfg.radius_m, device=grid_cfg.device)
@@ -645,6 +788,10 @@ def _build_phasor_base(state) -> PhasorSimulation:
 
 
 def step3_solve_currents(first_order_only: bool, log) -> Path:
+    label_for_clear = "first_order" if bool(first_order_only) else "self_consistent"
+    _clear_overview_cache(log, reason="Step 5 solve rerun", label=label_for_clear)
+    _clear_step4_field_cache(log, reason="Step 5 solve rerun", label=label_for_clear)
+    _clear_step6_field_cache(log, reason="Step 5 solve rerun", label=label_for_clear)
     state = _load_state("ambient.pt")
     grid_cfg: GridConfig = state["grid_cfg"]
     base = _build_phasor_base(state)
@@ -804,9 +951,11 @@ def step4_render_overview(label: str, log, plotter: str) -> Path:
     render_demo_overview(
         data_path=_save_state("overview_input.pt", payload),  # save tmp input for renderer
         save_path=str(out_path),
-        show=False,
+        show=True,
         grid_state_path=str(STATE_DIR / "grid_admittance.pt"),
         plotter=plotter,
+        cache_path=str(STATE_DIR / f"overview_cache_{label}.pt"),
+        cache_deps=_step4_dependency_signature(label),
     )
     dt = time.perf_counter() - t0
     log(f"Step 5 overview: rendered in {dt:.1f}s -> {out_path}")
@@ -820,6 +969,45 @@ def step4_render_gradient(label: str, altitude_m: float, log, plotter: str, grad
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     title = f"RSS |grad_B_emit| at alt={altitude_m/1000:.0f} km"
     save_path = FIG_DIR / f"nonuniform_grad_{int(altitude_m):d}m_{label}.png"
+    cache_name = _step4_gradient_cache_name(label, altitude_m, gradient_fd_scheme)
+    cache_path = STATE_DIR / cache_name
+    deps = _step4_dependency_signature(label)
+    cache_data = None
+    if cache_path.exists():
+        try:
+            candidate = _load_state(cache_name)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("kind") == "gradient_rss"
+                and candidate.get("deps") == deps
+                and int(candidate.get("altitude_m", -1)) == int(round(float(altitude_m)))
+                and str(candidate.get("fd_scheme", "")).strip().lower() == str(gradient_fd_scheme).strip().lower()
+            ):
+                cache_data = candidate
+        except Exception:
+            cache_data = None
+
+    if cache_data is None:
+        radius = float(sim_out.radius_m + altitude_m)
+        scale = radius / float(sim_out.radius_m)
+        positions = (sim_out.grid_positions * scale).to(dtype=torch.float64)
+        t0 = time.perf_counter()
+        rss = rss_gradient_from_emit(sim_out, positions, obs_radius=radius, fd_scheme=gradient_fd_scheme).to(torch.float64)
+        dt = time.perf_counter() - t0
+        cache_data = {
+            "kind": "gradient_rss",
+            "label": label,
+            "altitude_m": int(round(float(altitude_m))),
+            "fd_scheme": str(gradient_fd_scheme).strip().lower(),
+            "deps": deps,
+            "positions": positions.cpu(),
+            "rss": rss.cpu(),
+        }
+        _save_state(cache_name, cache_data)
+        log(f"Cached gradient field data to {cache_path} (compute {dt:.2f}s).")
+    else:
+        log(f"Loaded cached gradient field data from {cache_path}.")
+
     render_gradient_map(
         sim_out,
         altitude_m=altitude_m,
@@ -829,6 +1017,8 @@ def step4_render_gradient(label: str, altitude_m: float, log, plotter: str, grad
         plotter=plotter,
         timing_log=log,
         fd_scheme=gradient_fd_scheme,
+        positions_override=cache_data["positions"],
+        rss_values=cache_data["rss"],
     )
     log(f"Rendered gradient map to {save_path}")
     return save_path
@@ -842,6 +1032,45 @@ def step4_render_gradient_log100(label: str, log, plotter: str, gradient_fd_sche
     altitude_m = 100e3
     title = "RSS |grad_B_emit| at alt=100 km (log scale)"
     save_path = FIG_DIR / f"nonuniform_grad_{int(altitude_m):d}m_{label}_log.png"
+    cache_name = _step4_gradient_cache_name(label, altitude_m, gradient_fd_scheme)
+    cache_path = STATE_DIR / cache_name
+    deps = _step4_dependency_signature(label)
+    cache_data = None
+    if cache_path.exists():
+        try:
+            candidate = _load_state(cache_name)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("kind") == "gradient_rss"
+                and candidate.get("deps") == deps
+                and int(candidate.get("altitude_m", -1)) == int(round(float(altitude_m)))
+                and str(candidate.get("fd_scheme", "")).strip().lower() == str(gradient_fd_scheme).strip().lower()
+            ):
+                cache_data = candidate
+        except Exception:
+            cache_data = None
+
+    if cache_data is None:
+        radius = float(sim_out.radius_m + altitude_m)
+        scale = radius / float(sim_out.radius_m)
+        positions = (sim_out.grid_positions * scale).to(dtype=torch.float64)
+        t0 = time.perf_counter()
+        rss = rss_gradient_from_emit(sim_out, positions, obs_radius=radius, fd_scheme=gradient_fd_scheme).to(torch.float64)
+        dt = time.perf_counter() - t0
+        cache_data = {
+            "kind": "gradient_rss",
+            "label": label,
+            "altitude_m": int(round(float(altitude_m))),
+            "fd_scheme": str(gradient_fd_scheme).strip().lower(),
+            "deps": deps,
+            "positions": positions.cpu(),
+            "rss": rss.cpu(),
+        }
+        _save_state(cache_name, cache_data)
+        log(f"Cached gradient field data to {cache_path} (compute {dt:.2f}s).")
+    else:
+        log(f"Loaded cached gradient field data from {cache_path}.")
+
     render_gradient_map(
         sim_out,
         altitude_m=altitude_m,
@@ -852,6 +1081,8 @@ def step4_render_gradient_log100(label: str, log, plotter: str, gradient_fd_sche
         log_scale=True,
         timing_log=log,
         fd_scheme=gradient_fd_scheme,
+        positions_override=cache_data["positions"],
+        rss_values=cache_data["rss"],
     )
     log(f"Rendered log-scale gradient map to {save_path}")
     return save_path
@@ -866,6 +1097,44 @@ def step4_render_bmag100(label: str, log, plotter: str) -> Path:
     faces = grid_state["faces"]
     title = "RSS |B_emit| at alt=100 km"
     save_path = FIG_DIR / f"nonuniform_bmag_{int(altitude_m):d}m_{label}.png"
+    cache_name = _step4_bmag_cache_name(label, altitude_m)
+    cache_path = STATE_DIR / cache_name
+    deps = _step4_dependency_signature(label)
+    cache_data = None
+    if cache_path.exists():
+        try:
+            candidate = _load_state(cache_name)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("kind") == "bmag_rss"
+                and candidate.get("deps") == deps
+                and int(candidate.get("altitude_m", -1)) == int(round(float(altitude_m)))
+            ):
+                cache_data = candidate
+        except Exception:
+            cache_data = None
+
+    if cache_data is None:
+        obs_radius = float(sim_out.radius_m + altitude_m)
+        scale = obs_radius / float(sim_out.radius_m)
+        positions = (sim_out.grid_positions * scale).to(dtype=torch.float64)
+        t0 = time.perf_counter()
+        Br, Btheta, Bphi = toroidal_field_spherical(sim_out.K_toroidal, radius=float(sim_out.radius_m), positions=positions)
+        rss = torch.sqrt(torch.abs(Br) ** 2 + torch.abs(Btheta) ** 2 + torch.abs(Bphi) ** 2).to(torch.float64)
+        dt = time.perf_counter() - t0
+        cache_data = {
+            "kind": "bmag_rss",
+            "label": label,
+            "altitude_m": int(round(float(altitude_m))),
+            "deps": deps,
+            "positions": positions.cpu(),
+            "rss": rss.cpu(),
+        }
+        _save_state(cache_name, cache_data)
+        log(f"Cached B-field magnitude data to {cache_path} (compute {dt:.2f}s).")
+    else:
+        log(f"Loaded cached B-field magnitude data from {cache_path}.")
+
     render_b_magnitude_map(
         sim_out,
         altitude_m=altitude_m,
@@ -873,6 +1142,8 @@ def step4_render_bmag100(label: str, log, plotter: str) -> Path:
         title=title,
         faces=faces,
         plotter=plotter,
+        positions_override=cache_data["positions"],
+        rss_values=cache_data["rss"],
     )
     log(f"Rendered emitted-field magnitude map to {save_path}")
     return save_path
@@ -947,6 +1218,456 @@ def step4_plot_harmonics(label: str, log) -> None:
     log(f"Plotted harmonics magnitude and conductivity harmonics for {label}.")
 
 
+def _step6_cube_points(radius_m: float, n_edge: int) -> tuple[torch.Tensor, float]:
+    n_edge = max(3, int(n_edge))
+    _ = radius_m
+    cube_half = float(STEP6_CUBE_HALF_M)
+    axis = torch.linspace(-cube_half, cube_half, n_edge, dtype=torch.float64)
+    xx, yy, zz = torch.meshgrid(axis, axis, axis, indexing="ij")
+    pts = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
+    keep = torch.linalg.norm(pts, dim=-1) > (float(radius_m) * 1.02)
+    return pts[keep], cube_half
+
+
+def _step6_build_emitted_field_spectra(sim_out: PhasorSimulation) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if sim_out.B_tor_emit is None or sim_out.B_pol_emit is None or sim_out.B_rad_emit is None:
+        raise RuntimeError("Missing emitted field phasors; rerun solve before Step 6 plot.")
+    b_tor_emit = sim_out.B_tor_emit.to(torch.complex128)
+    b_pol_emit = sim_out.B_pol_emit.to(torch.complex128)
+    b_rad_emit = sim_out.B_rad_emit.to(torch.complex128)
+    return b_tor_emit, b_pol_emit, b_rad_emit
+
+
+def _step6_uniform_applied_field_phasor(sim_out: PhasorSimulation, ambient_state: dict, n_points: int) -> torch.Tensor:
+    axis = str(ambient_state.get("ambient_direction", "z")).strip().lower()
+    if axis not in {"x", "y", "z"}:
+        axis = "z"
+    amp = float(ambient_state.get("ambient_amplitude_t", sim_out.ambient_amplitude_t))
+    phase0 = float(getattr(ambient_state.get("ambient_cfg", None), "phase_rad", sim_out.ambient_phase_rad))
+    u = torch.zeros((3,), dtype=torch.complex128)
+    if axis == "x":
+        u[0] = 1.0
+    elif axis == "y":
+        u[1] = 1.0
+    else:
+        u[2] = 1.0
+    ph = torch.exp(torch.tensor(1j * phase0, dtype=torch.complex128))
+    vec = (amp * ph) * u
+    return vec.unsqueeze(0).repeat(max(1, int(n_points)), 1)
+
+
+
+def _step6_integrate_flowlines(
+    vec_pos: np.ndarray,
+    vec_dir: np.ndarray,
+    cube_half: float,
+    step_len: float,
+    n_steps: int,
+    n_seeds: int,
+) -> list[np.ndarray]:
+    if vec_pos.size == 0 or vec_dir.size == 0:
+        return []
+    n = vec_pos.shape[0]
+    seed_count = max(1, min(int(n_seeds), n))
+    seed_idx = np.linspace(0, n - 1, seed_count, dtype=int)
+
+    def _nearest_dir(p: np.ndarray) -> np.ndarray:
+        d2 = np.sum((vec_pos - p[None, :]) ** 2, axis=1)
+        i = int(np.argmin(d2))
+        return vec_dir[i]
+
+    lines: list[np.ndarray] = []
+    for i in seed_idx:
+        seed = vec_pos[i]
+        for sign in (1.0, -1.0):
+            pts = [seed.copy()]
+            p = seed.copy()
+            for _ in range(max(1, int(n_steps))):
+                d = _nearest_dir(p)
+                p = p + sign * step_len * d
+                if np.any(np.abs(p) > cube_half):
+                    break
+                pts.append(p.copy())
+            if len(pts) >= 2:
+                lines.append(np.asarray(pts))
+    return lines
+
+
+def step6_render_magnetic_vectors(
+    label: str,
+    field_mode: str,
+    display_mode: str,
+    show_gradient_shell: bool,
+    gradient_fd_scheme: str,
+    gradient_alpha: float,
+    t_sec: float,
+    n_edge: int,
+    log,
+) -> Path:
+    payload = _load_solution(label)
+    sim_out: PhasorSimulation = payload["phasor_sim"]
+    grid_state = _load_state("grid_admittance.pt")
+    ambient_state = _load_state("ambient.pt")
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    mode = str(field_mode).strip().lower()
+    if mode not in {"applied", "emitted", "combined"}:
+        raise RuntimeError(f"Unknown Step 6 field mode: {field_mode}")
+    display = str(display_mode).strip().lower()
+    if display not in {"vectors", "flow"}:
+        raise RuntimeError(f"Unknown Step 6 display mode: {display_mode}")
+    fd_key = str(gradient_fd_scheme or "forward").strip().lower()
+    if fd_key not in {"forward", "central"}:
+        raise RuntimeError(f"Unknown finite-difference scheme: {gradient_fd_scheme}")
+    grad_alpha = float(max(0.0, min(1.0, gradient_alpha)))
+    n_edge = max(3, int(n_edge))
+    t_sec = float(t_sec)
+
+    cache_name = _step6_field_cache_name(label, mode, n_edge)
+    cache_path = STATE_DIR / cache_name
+    deps = _step4_dependency_signature(label)
+    cache_data = None
+    if cache_path.exists():
+        try:
+            candidate = _load_state(cache_name)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("kind") == "step6_field_phasors"
+                and candidate.get("deps") == deps
+                and int(candidate.get("n_edge", -1)) == int(n_edge)
+                and str(candidate.get("field_mode", "")).strip().lower() == mode
+                and abs(float(candidate.get("cube_half_m", -1.0)) - float(STEP6_CUBE_HALF_M)) <= 1e-9
+            ):
+                cache_data = candidate
+        except Exception:
+            cache_data = None
+
+    if cache_data is None:
+        sample_pts, cube_half = _step6_cube_points(sim_out.radius_m, n_edge)
+        t0 = time.perf_counter()
+        b_applied = _step6_uniform_applied_field_phasor(sim_out, ambient_state, sample_pts.shape[0])
+        if mode == "applied":
+            B_phasor = b_applied
+        elif mode == "emitted":
+            b_tor, b_pol, b_rad = _step6_build_emitted_field_spectra(sim_out)
+            B_phasor = evaluate_field_from_spectral(
+                b_tor,
+                b_pol,
+                b_rad,
+                sample_pts.to(dtype=torch.float64),
+            ).to(torch.complex128)
+        else:
+            b_tor, b_pol, b_rad = _step6_build_emitted_field_spectra(sim_out)
+            b_emit = evaluate_field_from_spectral(
+                b_tor,
+                b_pol,
+                b_rad,
+                sample_pts.to(dtype=torch.float64),
+            ).to(torch.complex128)
+            B_phasor = b_emit + b_applied
+        dt = time.perf_counter() - t0
+        cache_data = {
+            "kind": "step6_field_phasors",
+            "label": label,
+            "field_mode": mode,
+            "n_edge": int(n_edge),
+            "cube_half_m": float(cube_half),
+            "deps": deps,
+            "positions": sample_pts.cpu(),
+            "B_phasor": B_phasor.cpu(),
+        }
+        _save_state(cache_name, cache_data)
+        log(f"Step 6 cached phasors to {cache_path} (compute {dt:.2f}s, n={sample_pts.shape[0]}).")
+    else:
+        log(f"Step 6 loaded cached phasors from {cache_path}.")
+
+    positions = cache_data["positions"].to(torch.float64)
+    b_phasor = cache_data["B_phasor"].to(torch.complex128)
+    phase = np.exp(1j * float(sim_out.omega) * t_sec)
+    b_real = torch.real(b_phasor * phase).to(torch.float64)
+
+    norms = torch.linalg.norm(b_real, dim=-1)
+    keep = norms > 0.0
+    vec_pos = positions[keep]
+    vec_dir = b_real[keep]
+    vec_norm = torch.linalg.norm(vec_dir, dim=-1, keepdim=True).clamp_min(1e-30)
+    vec_dir = vec_dir / vec_norm
+
+    surf_pts_m = grid_state["positions"].to(torch.float64).cpu().numpy()
+    faces = grid_state["faces"]
+    face_np = faces.detach().cpu().numpy() if isinstance(faces, torch.Tensor) else np.asarray(faces)
+    sigma = grid_state.get("sigma_grid")
+    if sigma is None:
+        sigma_vals = np.zeros((surf_pts_m.shape[0],), dtype=np.float64)
+    else:
+        sigma_vals = sigma.detach().cpu().numpy().reshape(-1)
+    face_sigma = sigma_vals[face_np].mean(axis=1)
+    tri_verts = (surf_pts_m / 1.0e6)[face_np]
+    vmin = float(np.nanmin(face_sigma)) if face_sigma.size else 0.0
+    vmax = float(np.nanmax(face_sigma)) if face_sigma.size else 1.0
+    if vmax <= vmin:
+        vmax = vmin + max(abs(vmin) * 1e-6, 1e-30)
+    norm = colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = cm.get_cmap("Greys")
+    face_colors = cmap(norm(face_sigma))
+
+    cube_half_m = float(cache_data["cube_half_m"])
+    step_m = (2.0 * cube_half_m) / max(int(n_edge) - 1, 1)
+    arrow_len = (0.35 * step_m) / 1.0e6
+    cube_half_mm = cube_half_m / 1.0e6
+    title_mode = {"applied": "Applied", "emitted": "Emitted", "combined": "Combined"}[mode]
+    display_title = "Vectors" if display == "vectors" else "Flow lines"
+    t_tag = f"{t_sec:.3f}".replace(".", "p")
+    grad_tag = "_withgrad" if bool(show_gradient_shell) else ""
+    save_path = FIG_DIR / f"nonuniform_field_{display}{grad_tag}_{label}_{mode}_{int(n_edge)}edge_t{t_tag}s.png"
+
+    fig = plt.figure(figsize=(10.5, 8.0))
+    ax = fig.add_subplot(111, projection="3d")
+    surface = Poly3DCollection(
+        tri_verts,
+        facecolors=face_colors,
+        edgecolor="none",
+        linewidth=0.05,
+        alpha=1.0,
+        antialiased=True,
+    )
+    ax.add_collection3d(surface)
+    grad_map = None
+    grad_alt_km = None
+    if bool(show_gradient_shell):
+        grad_cache = _load_latest_step4_gradient_cache(label, fd_key)
+        grad_pos = grad_cache["positions"].to(torch.float64).cpu().numpy()
+        grad_rss = grad_cache["rss"].to(torch.float64).cpu().numpy().reshape(-1)
+        tri_grad = (grad_pos / 1.0e6)[face_np]
+        face_grad = grad_rss[face_np].mean(axis=1) * 1.0e12
+        centers = tri_grad.mean(axis=1)
+        hemi_mask = centers[:, 0] >= 0.0
+        tri_grad_half = tri_grad[hemi_mask]
+        face_grad_half = face_grad[hemi_mask]
+        gmin = float(np.nanmin(face_grad_half)) if face_grad_half.size else 0.0
+        gmax = float(np.nanmax(face_grad_half)) if face_grad_half.size else 1.0
+        if gmax <= gmin:
+            gmax = gmin + max(abs(gmin) * 1e-6, 1e-30)
+        grad_norm = colors.Normalize(vmin=gmin, vmax=gmax)
+        grad_colors = cm.get_cmap("rainbow")(grad_norm(face_grad_half))
+        grad_surface = Poly3DCollection(
+            tri_grad_half,
+            facecolors=grad_colors,
+            edgecolor="none",
+            linewidth=0.05,
+            alpha=grad_alpha,
+            antialiased=True,
+        )
+        ax.add_collection3d(grad_surface)
+        grad_map = cm.ScalarMappable(norm=grad_norm, cmap=cm.get_cmap("rainbow"))
+        grad_map.set_array(face_grad_half)
+        grad_alt_km = float(grad_cache.get("altitude_m", _latest_step4_gradient_altitude_m(label, fd_key))) / 1000.0
+
+    if display == "vectors" and vec_pos.shape[0] > 0:
+        p = vec_pos.cpu().numpy() / 1.0e6
+        d = vec_dir.cpu().numpy()
+        ax.quiver(
+            p[:, 0],
+            p[:, 1],
+            p[:, 2],
+            d[:, 0],
+            d[:, 1],
+            d[:, 2],
+            length=arrow_len,
+            normalize=True,
+            color="#202020",
+            linewidth=0.8,
+        )
+    elif display == "flow" and vec_pos.shape[0] > 0:
+        p = vec_pos.cpu().numpy()
+        d = vec_dir.cpu().numpy()
+        lines = _step6_integrate_flowlines(
+            vec_pos=p,
+            vec_dir=d,
+            cube_half=cube_half_m,
+            step_len=0.30 * step_m,
+            n_steps=14,
+            n_seeds=max(12, min(80, p.shape[0] // 2)),
+        )
+        for line in lines:
+            line_mm = line / 1.0e6
+            ax.plot(
+                line_mm[:, 0],
+                line_mm[:, 1],
+                line_mm[:, 2],
+                color="#202020",
+                linewidth=1.0,
+                alpha=0.9,
+            )
+
+    lim = cube_half_mm
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_zlim(-lim, lim)
+    ax.set_box_aspect([1, 1, 1])
+    ax.set_xlabel("x (Mm)")
+    ax.set_ylabel("y (Mm)")
+    ax.set_zlabel("z (Mm)")
+    title = f"Step 6 magnetic field {display_title} ({title_mode}) at t={t_sec:.3f} s"
+    if bool(show_gradient_shell):
+        title += f", gradients at alt={grad_alt_km:.0f} km"
+    ax.set_title(title)
+    mappable = cm.ScalarMappable(norm=norm, cmap=cmap)
+    mappable.set_array(face_sigma)
+    fig.colorbar(mappable, ax=ax, pad=0.04, shrink=0.72, label="Conductivity sigma_s (S)")
+    if grad_map is not None:
+        fig.colorbar(grad_map, ax=ax, pad=0.12, shrink=0.72, label="|grad_B_emit| RSS (pT/m)")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.show()
+    log(f"Step 6 rendered magnetic field {display_title.lower()} to {save_path}")
+    return save_path
+
+
+def step6_render_gradient_shell(label: str, field_mode: str, altitude_m: float, fd_scheme: str, log) -> Path:
+    payload = _load_solution(label)
+    sim_out: PhasorSimulation = payload["phasor_sim"]
+    grid_state = _load_state("grid_admittance.pt")
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    mode = str(field_mode).strip().lower()
+    if mode not in {"applied", "emitted", "combined"}:
+        raise RuntimeError(f"Unknown Step 6 field mode: {field_mode}")
+    altitude_m = max(0.0, float(altitude_m))
+    fd_key = str(fd_scheme or "forward").strip().lower()
+    if fd_key not in {"forward", "central"}:
+        raise RuntimeError(f"Unknown finite-difference scheme: {fd_scheme}")
+
+    cache_name = _step6_gradient_cache_name(label, mode, altitude_m, fd_key)
+    cache_path = STATE_DIR / cache_name
+    deps = _step4_dependency_signature(label)
+    cache_data = None
+    if cache_path.exists():
+        try:
+            candidate = _load_state(cache_name)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("kind") == "step6_gradient_rss"
+                and candidate.get("deps") == deps
+                and str(candidate.get("field_mode", "")).strip().lower() == mode
+                and int(candidate.get("altitude_m", -1)) == int(round(altitude_m))
+                and str(candidate.get("fd_scheme", "")).strip().lower() == fd_key
+            ):
+                cache_data = candidate
+        except Exception:
+            cache_data = None
+
+    if cache_data is None:
+        scale = float(sim_out.radius_m + altitude_m) / float(sim_out.radius_m)
+        positions_obs = (sim_out.grid_positions * scale).to(dtype=torch.float64)
+        t0 = time.perf_counter()
+        if mode == "applied":
+            rss = torch.zeros((positions_obs.shape[0],), dtype=torch.float64)
+        else:
+            rss = rss_gradient_from_emit(
+                sim_out,
+                positions_obs,
+                obs_radius=float(sim_out.radius_m + altitude_m),
+                fd_scheme=fd_key,
+            ).to(torch.float64)
+        dt = time.perf_counter() - t0
+        cache_data = {
+            "kind": "step6_gradient_rss",
+            "label": label,
+            "field_mode": mode,
+            "altitude_m": int(round(altitude_m)),
+            "fd_scheme": fd_key,
+            "deps": deps,
+            "positions_obs": positions_obs.cpu(),
+            "rss": rss.cpu(),
+        }
+        _save_state(cache_name, cache_data)
+        log(f"Step 6 cached gradient shell data to {cache_path} (compute {dt:.2f}s).")
+    else:
+        log(f"Step 6 loaded cached gradient shell data from {cache_path}.")
+
+    faces = grid_state["faces"]
+    face_np = faces.detach().cpu().numpy() if isinstance(faces, torch.Tensor) else np.asarray(faces)
+
+    surf_pts_m = grid_state["positions"].to(torch.float64).cpu().numpy()
+    tri_cond = (surf_pts_m / 1.0e6)[face_np]
+    sigma = grid_state.get("sigma_grid")
+    sigma_vals = np.zeros((surf_pts_m.shape[0],), dtype=np.float64) if sigma is None else sigma.detach().cpu().numpy().reshape(-1)
+    face_sigma = sigma_vals[face_np].mean(axis=1)
+    cond_vmin = float(np.nanmin(face_sigma)) if face_sigma.size else 0.0
+    cond_vmax = float(np.nanmax(face_sigma)) if face_sigma.size else 1.0
+    if cond_vmax <= cond_vmin:
+        cond_vmax = cond_vmin + max(abs(cond_vmin) * 1e-6, 1e-30)
+    cond_norm = colors.Normalize(vmin=cond_vmin, vmax=cond_vmax)
+    cond_colors = cm.get_cmap("Greys")(cond_norm(face_sigma))
+
+    obs_pts_m = cache_data["positions_obs"].to(torch.float64).cpu().numpy()
+    rss = cache_data["rss"].to(torch.float64).cpu().numpy().reshape(-1)
+    tri_grad = (obs_pts_m / 1.0e6)[face_np]
+    face_grad = rss[face_np].mean(axis=1) * 1.0e12
+    centers = tri_grad.mean(axis=1)
+    hemi_mask = centers[:, 0] >= 0.0
+    tri_grad_half = tri_grad[hemi_mask]
+    face_grad_half = face_grad[hemi_mask]
+    grad_vmin = float(np.nanmin(face_grad_half)) if face_grad_half.size else 0.0
+    grad_vmax = float(np.nanmax(face_grad_half)) if face_grad_half.size else 1.0
+    if grad_vmax <= grad_vmin:
+        grad_vmax = grad_vmin + max(abs(grad_vmin) * 1e-6, 1e-30)
+    grad_norm = colors.Normalize(vmin=grad_vmin, vmax=grad_vmax)
+    grad_colors = cm.get_cmap("rainbow")(grad_norm(face_grad_half))
+
+    title_mode = {"applied": "Applied", "emitted": "Emitted", "combined": "Combined"}[mode]
+    alt_km = altitude_m / 1000.0
+    save_path = FIG_DIR / (
+        f"nonuniform_gradient_shell_{label}_{mode}_{int(round(altitude_m))}m_{fd_key}.png"
+    )
+
+    fig = plt.figure(figsize=(11.0, 8.2))
+    ax = fig.add_subplot(111, projection="3d")
+    cond_surface = Poly3DCollection(
+        tri_cond,
+        facecolors=cond_colors,
+        edgecolor="none",
+        linewidth=0.05,
+        alpha=1.0,
+        antialiased=True,
+    )
+    ax.add_collection3d(cond_surface)
+    grad_surface = Poly3DCollection(
+        tri_grad_half,
+        facecolors=grad_colors,
+        edgecolor="none",
+        linewidth=0.05,
+        alpha=0.75,
+        antialiased=True,
+    )
+    ax.add_collection3d(grad_surface)
+
+    lim = float(STEP6_CUBE_HALF_M / 1.0e6)
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_zlim(-lim, lim)
+    ax.set_box_aspect([1, 1, 1])
+    ax.set_xlabel("x (Mm)")
+    ax.set_ylabel("y (Mm)")
+    ax.set_zlabel("z (Mm)")
+    ax.set_title(
+        f"Step 6 gradient shell ({title_mode}) at alt={alt_km:.0f} km; "
+        "conductivity at ocean radius"
+    )
+    cond_map = cm.ScalarMappable(norm=cond_norm, cmap=cm.get_cmap("Greys"))
+    cond_map.set_array(face_sigma)
+    grad_map = cm.ScalarMappable(norm=grad_norm, cmap=cm.get_cmap("rainbow"))
+    grad_map.set_array(face_grad_half)
+    fig.colorbar(cond_map, ax=ax, pad=0.02, shrink=0.62, label="Conductivity sigma_s (S)")
+    fig.colorbar(grad_map, ax=ax, pad=0.10, shrink=0.62, label="|grad_B_emit| RSS (pT/m)")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.show()
+    log(f"Step 6 rendered gradient shell to {save_path}")
+    return save_path
+
+
 def _clear_outputs(log) -> None:
     for path in (FIG_DIR, STATE_DIR):
         if path.exists():
@@ -956,6 +1677,9 @@ def _clear_outputs(log) -> None:
 
 
 def step6_iterative_solve(order: int, log) -> Path:
+    _clear_overview_cache(log, reason="Step 5 solve rerun", label="iterative")
+    _clear_step4_field_cache(log, reason="Step 5 solve rerun", label="iterative")
+    _clear_step6_field_cache(log, reason="Step 5 solve rerun", label="iterative")
     state = _load_state("ambient.pt")
     grid_cfg: GridConfig = state["grid_cfg"]
     base = _build_phasor_base(state)
@@ -1185,6 +1909,7 @@ def main():
         _set_button_state(btn_grad100_log, selected_ok, color=selected_color if selected_ok else None)
         _set_button_state(btn_harm, selected_ok, color=selected_color if selected_ok else None)
         _set_button_state(btn_bmag100, selected_ok, color=selected_color if selected_ok else None)
+        _set_button_state(btn_step6_field, selected_ok, color=selected_color if selected_ok else None)
 
     # Step 1: load latest run folder
     ttk.Label(frm, text="Step 1: Run folder").grid(row=0, column=0, sticky="w")
@@ -1242,6 +1967,12 @@ def main():
     default_ambient_axis = "z"
     default_ambient_amplitude = "1e-6"
     default_ambient_period_hours = "9.925"
+    default_step6_time_sec = "0.0"
+    default_step6_grid_n = "7"
+    default_step6_field_mode = "combined"
+    default_step6_display_mode = "vectors"
+    default_step6_show_gradient = True
+    default_step6_gradient_alpha = "0.75"
     lmax_var = tk.StringVar(value=default_lmax)
     ttk.Entry(frm, textvariable=lmax_var, width=6).grid(row=1, column=2, sticky="w")
 
@@ -1303,6 +2034,12 @@ def main():
     ambient_direction_var = tk.StringVar(value=default_ambient_axis)
     ambient_amplitude_var = tk.StringVar(value=default_ambient_amplitude)
     ambient_period_var = tk.StringVar(value=default_ambient_period_hours)
+    step6_time_sec_var = tk.StringVar(value=default_step6_time_sec)
+    step6_grid_n_var = tk.StringVar(value=default_step6_grid_n)
+    step6_field_mode_var = tk.StringVar(value=default_step6_field_mode)
+    step6_display_mode_var = tk.StringVar(value=default_step6_display_mode)
+    step6_show_gradient_var = tk.BooleanVar(value=default_step6_show_gradient)
+    step6_gradient_alpha_var = tk.StringVar(value=default_step6_gradient_alpha)
 
     def _reset_inputs_to_defaults(log_reset: bool = True) -> None:
         lmax_var.set(default_lmax)
@@ -1318,6 +2055,12 @@ def main():
         plotter_var.set(default_plotter)
         gradient_fd_var.set(default_gradient_fd_scheme)
         solve_mode_var.set("self_consistent")
+        step6_time_sec_var.set(default_step6_time_sec)
+        step6_grid_n_var.set(default_step6_grid_n)
+        step6_field_mode_var.set(default_step6_field_mode)
+        step6_display_mode_var.set(default_step6_display_mode)
+        step6_show_gradient_var.set(default_step6_show_gradient)
+        step6_gradient_alpha_var.set(default_step6_gradient_alpha)
         _update_grid_counts()
         if log_reset:
             _log(log_widget, "Reset GUI inputs to defaults.")
@@ -1547,6 +2290,73 @@ def main():
     )
     btn_harm.grid(row=8, column=7, padx=4, sticky="w")
 
+    # Step 6: 3D magnetic vectors around conductivity sphere
+    ttk.Label(frm, text="Step 6: Field vectors around sphere").grid(row=9, column=0, sticky="w")
+    ttk.Label(frm, text="t (s)").grid(row=9, column=1, sticky="e")
+    ttk.Entry(frm, textvariable=step6_time_sec_var, width=8).grid(row=9, column=2, sticky="w")
+    ttk.Label(frm, text="cube edge vectors").grid(row=9, column=3, sticky="e")
+    ttk.Entry(frm, textvariable=step6_grid_n_var, width=6).grid(row=9, column=4, sticky="w")
+    tk.Radiobutton(
+        frm,
+        text="Applied",
+        variable=step6_field_mode_var,
+        value="applied",
+    ).grid(row=9, column=5, sticky="w")
+    tk.Radiobutton(
+        frm,
+        text="Emitted",
+        variable=step6_field_mode_var,
+        value="emitted",
+    ).grid(row=9, column=6, sticky="w")
+    tk.Radiobutton(
+        frm,
+        text="Combined",
+        variable=step6_field_mode_var,
+        value="combined",
+    ).grid(row=9, column=7, sticky="w")
+    tk.Radiobutton(
+        frm,
+        text="Vectors",
+        variable=step6_display_mode_var,
+        value="vectors",
+    ).grid(row=10, column=5, sticky="w")
+    tk.Radiobutton(
+        frm,
+        text="Flow lines",
+        variable=step6_display_mode_var,
+        value="flow",
+    ).grid(row=10, column=6, sticky="w")
+    tk.Checkbutton(
+        frm,
+        text="Overlay gradient shell (use prior Step 5 gradient cache)",
+        variable=step6_show_gradient_var,
+        onvalue=True,
+        offvalue=False,
+    ).grid(row=10, column=7, sticky="w")
+    ttk.Label(frm, text="grad alpha [0-1]").grid(row=10, column=3, sticky="e")
+    ttk.Entry(frm, textvariable=step6_gradient_alpha_var, width=6).grid(row=10, column=4, sticky="w")
+    btn_step6_field = tk.Button(
+        frm,
+        text="Plot field",
+        wraplength=180,
+        justify="left",
+        command=lambda: run_step_ui(
+            btn_step6_field,
+            lambda: step6_render_magnetic_vectors(
+                _selected_mode(),
+                step6_field_mode_var.get(),
+                step6_display_mode_var.get(),
+                bool(step6_show_gradient_var.get()),
+                gradient_fd_var.get(),
+                float(step6_gradient_alpha_var.get()),
+                float(step6_time_sec_var.get()),
+                int(step6_grid_n_var.get()),
+                lambda msg: _log(log_widget, msg),
+            ),
+        ),
+    )
+    btn_step6_field.grid(row=9, column=8, padx=4, sticky="w")
+
     def _update_selected_mode_labels() -> None:
         mode = _selected_mode()
         label = mode_labels[mode]
@@ -1556,6 +2366,7 @@ def main():
         btn_grad100.config(text=f"Gradients @ 100 km ({label})")
         btn_grad100_log.config(text=f"Gradients @ 100 km (log, {label})")
         btn_bmag100.config(text=f"B magnitude @ 100 km ({label})")
+        btn_step6_field.config(text=f"Plot field ({label})")
 
     solve_mode_var.trace_add("write", lambda *_: (_update_selected_mode_labels(), _update_button_states()))
     _update_selected_mode_labels()
