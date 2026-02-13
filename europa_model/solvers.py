@@ -248,9 +248,9 @@ def self_consistent_current(
     while Y_s.dim() < B_radial_ext.dim():
         Y_s = Y_s.unsqueeze(0)
 
-    # Faraday diagonal F and self-field diagonal S (matching spectral solve)
+    # Faraday diagonal F and signed self-field diagonal S (matching spectral solve)
     F = -(1j * omega * radius) / ell  # shape like ell
-    S = inductance.MU0 / ((2 * l + 1).view(lmax + 1, 1) * ell)  # μ0 / [(2ℓ+1) ℓ(ℓ+1)]
+    S = -inductance.MU0 / ((2 * l + 1).view(lmax + 1, 1) * ell)  # -mu0 / [(2l+1) l(l+1)]
     while S.dim() < B_radial_ext.dim():
         S = S.unsqueeze(0)
 
@@ -278,7 +278,7 @@ def _build_self_field_diag(lmax: int, device, dtype) -> torch.Tensor:
     """Diagonal map S: k -> b_self (normal component on surface) flattened."""
     S = torch.zeros((lmax + 1, 2 * lmax + 1), device=device, dtype=dtype)
     for l in range(1, lmax + 1):
-        S[l] = inductance.MU0 / ((2 * l + 1) * l * (l + 1))
+        S[l] = -inductance.MU0 / ((2 * l + 1) * l * (l + 1))
     return _flatten_lm(S)
 
 
@@ -484,3 +484,4 @@ def run_uniform_self_consistent(
     K_tor = ph.K_toroidal
     K_pol = ph.K_poloidal
     return K_tor, K_pol
+

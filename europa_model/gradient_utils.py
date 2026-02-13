@@ -451,23 +451,38 @@ def render_gradient_map(
     log_scale: bool = False,
     timing_log=None,
     fd_scheme: str = "forward",
+    rss_values: torch.Tensor | np.ndarray | None = None,
+    positions_override: torch.Tensor | np.ndarray | None = None,
 ) -> None:
     import matplotlib.pyplot as plt
 
-    radius = sim.radius_m + altitude_m
-    scale = radius / sim.radius_m
-    positions = (sim.grid_positions * scale).to(dtype=torch.float64)
-    t_grad0 = time.perf_counter()
-    rss = rss_gradient_from_emit(sim, positions, obs_radius=radius, fd_scheme=fd_scheme).cpu().numpy()
-    grad_dt = time.perf_counter() - t_grad0
-    if timing_log is not None:
-        try:
-            timing_log(
-                f"Gradient compute only: {grad_dt:.2f}s "
-                f"(nodes={positions.shape[0]}, method=cartesian_spectral, scheme={fd_scheme})"
-            )
-        except Exception:
-            pass
+    if positions_override is None:
+        radius = sim.radius_m + altitude_m
+        scale = radius / sim.radius_m
+        positions = (sim.grid_positions * scale).to(dtype=torch.float64)
+    else:
+        positions = positions_override
+        if isinstance(positions, np.ndarray):
+            positions = torch.from_numpy(positions).to(dtype=torch.float64)
+        else:
+            positions = positions.to(dtype=torch.float64)
+
+    if rss_values is None:
+        t_grad0 = time.perf_counter()
+        rss = rss_gradient_from_emit(sim, positions, obs_radius=float(sim.radius_m + altitude_m), fd_scheme=fd_scheme).cpu().numpy()
+        grad_dt = time.perf_counter() - t_grad0
+        if timing_log is not None:
+            try:
+                timing_log(
+                    f"Gradient compute only: {grad_dt:.2f}s "
+                    f"(nodes={positions.shape[0]}, method=cartesian_spectral, scheme={fd_scheme})"
+                )
+            except Exception:
+                pass
+    elif isinstance(rss_values, np.ndarray):
+        rss = rss_values
+    else:
+        rss = rss_values.detach().cpu().numpy()
 
     pts = positions.detach().cpu().numpy()
     if faces is None:
@@ -619,17 +634,32 @@ def render_b_magnitude_map(
     plotter: str = "pyvista",
     subdivisions: int = 0,
     log_scale: bool = False,
+    rss_values: torch.Tensor | np.ndarray | None = None,
+    positions_override: torch.Tensor | np.ndarray | None = None,
 ) -> None:
     import matplotlib.pyplot as plt
 
     if sim.K_toroidal is None:
         raise ValueError("K_toroidal is required to render emitted-field magnitude.")
 
-    obs_radius = float(sim.radius_m + altitude_m)
-    scale = obs_radius / float(sim.radius_m)
-    positions = (sim.grid_positions * scale).to(dtype=torch.float64)
-    Br, Btheta, Bphi = toroidal_field_spherical(sim.K_toroidal, radius=float(sim.radius_m), positions=positions)
-    rss = torch.sqrt(torch.abs(Br) ** 2 + torch.abs(Btheta) ** 2 + torch.abs(Bphi) ** 2).cpu().numpy()
+    if positions_override is None:
+        obs_radius = float(sim.radius_m + altitude_m)
+        scale = obs_radius / float(sim.radius_m)
+        positions = (sim.grid_positions * scale).to(dtype=torch.float64)
+    else:
+        positions = positions_override
+        if isinstance(positions, np.ndarray):
+            positions = torch.from_numpy(positions).to(dtype=torch.float64)
+        else:
+            positions = positions.to(dtype=torch.float64)
+
+    if rss_values is None:
+        Br, Btheta, Bphi = toroidal_field_spherical(sim.K_toroidal, radius=float(sim.radius_m), positions=positions)
+        rss = torch.sqrt(torch.abs(Br) ** 2 + torch.abs(Btheta) ** 2 + torch.abs(Bphi) ** 2).cpu().numpy()
+    elif isinstance(rss_values, np.ndarray):
+        rss = rss_values
+    else:
+        rss = rss_values.detach().cpu().numpy()
 
     pts = positions.detach().cpu().numpy()
     if faces is None:
