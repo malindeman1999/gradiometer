@@ -258,7 +258,7 @@ def render_demo_overview(
         "Gradient RSS harmonics by degree l",
     ]
     bar_units = ["S", "T", "V/m", "A/m", "T", "T/m"]
-    bar_colors = ["#ff9c43", "#4472c4", "#2ca7a0", "#70ad47", "#c55a11", "#8c564b"]
+    bar_colors = ["#666666", "#c73e3a", "#2f8f2f", "#2c69c9", "#b22222", "#000000"]
 
     sphere_fields = None
     if isinstance(cached_sphere_values, dict):
@@ -272,11 +272,11 @@ def render_demo_overview(
             b_emit_cached = torch.as_tensor(cached_sphere_values["B_emit_r"], dtype=torch.float64).cpu().numpy()
             grad_cached = torch.as_tensor(cached_sphere_values["grad_rss"], dtype=torch.float64).cpu().numpy()
             sphere_fields = [
-                ("sigma_s", sigma_cached, "S", False, "rainbow"),
-                ("|B_r|", b_r_cached, "T", False, "rainbow"),
-                ("|E_tor|", e_cached, "V/m", False, "rainbow"),
-                ("|K_tor|", k_cached, "A/m", False, "rainbow"),
-                ("|B_emit,r|", b_emit_cached, "T", False, "rainbow"),
+                ("sigma_s", sigma_cached, "S", False, "Greys"),
+                ("|B_r|", b_r_cached, "T", False, "Reds"),
+                ("|E_tor|", e_cached, "V/m", False, "Greens"),
+                ("|K_tor|", k_cached, "A/m", False, "Blues"),
+                ("|B_emit,r|", b_emit_cached, "T", False, "Reds"),
                 ("|grad_B_emit| RSS @100 km", grad_cached, "T/m", False, "rainbow"),
             ]
 
@@ -289,11 +289,11 @@ def render_demo_overview(
         b_emit_vals = _scalar_from_sh(B_rad_emit_ph, points)
         grad_vals = grad_rss.cpu().numpy()
         sphere_fields = [
-            ("sigma_s", sigma_vals, "S", False, "rainbow"),
-            ("|B_r|", b_r_vals, "T", False, "rainbow"),
-            ("|E_tor|", e_tor_vals, "V/m", False, "rainbow"),
-            ("|K_tor|", k_tor_vals, "A/m", False, "rainbow"),
-            ("|B_emit,r|", b_emit_vals, "T", False, "rainbow"),
+            ("sigma_s", sigma_vals, "S", False, "Greys"),
+            ("|B_r|", b_r_vals, "T", False, "Reds"),
+            ("|E_tor|", e_tor_vals, "V/m", False, "Greens"),
+            ("|K_tor|", k_tor_vals, "A/m", False, "Blues"),
+            ("|B_emit,r|", b_emit_vals, "T", False, "Reds"),
             ("|grad_B_emit| RSS @100 km", grad_vals, "T/m", False, "rainbow"),
         ]
         _save_overview_cache(
