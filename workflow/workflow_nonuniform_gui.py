@@ -1293,6 +1293,35 @@ def _step6_integrate_flowlines(
     return lines
 
 
+def _visible_points_for_3d_view(
+    points_xyz: np.ndarray,
+    sphere_radius: float,
+    elev_deg: float,
+    azim_deg: float,
+) -> np.ndarray:
+    """Mask points occluded by an opaque sphere at origin for the current 3D view."""
+    pts = np.asarray(points_xyz, dtype=np.float64)
+    elev = math.radians(float(elev_deg))
+    azim = math.radians(float(azim_deg))
+    view = np.array(
+        [
+            math.cos(elev) * math.cos(azim),
+            math.cos(elev) * math.sin(azim),
+            math.sin(elev),
+        ],
+        dtype=np.float64,
+    )
+    view = view / max(np.linalg.norm(view), 1e-30)
+    depth = pts @ view
+    perp = pts - np.outer(depth, view)
+    rho2 = np.sum(perp * perp, axis=1)
+    r2 = float(sphere_radius) ** 2
+    in_disc = rho2 < r2
+    front_depth = np.sqrt(np.clip(r2 - rho2, 0.0, None))
+    occluded = in_disc & (depth < front_depth)
+    return ~occluded
+
+
 def step6_render_magnetic_vectors(
     label: str,
     field_mode: str,
@@ -1403,6 +1432,7 @@ def step6_render_magnetic_vectors(
         sigma_vals = sigma.detach().cpu().numpy().reshape(-1)
     face_sigma = sigma_vals[face_np].mean(axis=1)
     tri_verts = (surf_pts_m / 1.0e6)[face_np]
+    sphere_radius_mm = float(np.median(np.linalg.norm(surf_pts_m / 1.0e6, axis=1)))
     vmin = float(np.nanmin(face_sigma)) if face_sigma.size else 0.0
     vmax = float(np.nanmax(face_sigma)) if face_sigma.size else 1.0
     if vmax <= vmin:
@@ -1466,18 +1496,27 @@ def step6_render_magnetic_vectors(
     if display == "vectors" and vec_pos.shape[0] > 0:
         p = vec_pos.cpu().numpy() / 1.0e6
         d = vec_dir.cpu().numpy()
-        ax.quiver(
-            p[:, 0],
-            p[:, 1],
-            p[:, 2],
-            d[:, 0],
-            d[:, 1],
-            d[:, 2],
-            length=arrow_len,
-            normalize=True,
-            color="#202020",
-            linewidth=0.8,
+        vis = _visible_points_for_3d_view(
+            p,
+            sphere_radius=sphere_radius_mm,
+            elev_deg=float(getattr(ax, "elev", 30.0)),
+            azim_deg=float(getattr(ax, "azim", -60.0)),
         )
+        p = p[vis]
+        d = d[vis]
+        if p.shape[0] > 0:
+            ax.quiver(
+                p[:, 0],
+                p[:, 1],
+                p[:, 2],
+                d[:, 0],
+                d[:, 1],
+                d[:, 2],
+                length=arrow_len,
+                normalize=True,
+                color="#202020",
+                linewidth=0.8,
+            )
     elif display == "flow" and vec_pos.shape[0] > 0:
         p = vec_pos.cpu().numpy()
         d = vec_dir.cpu().numpy()

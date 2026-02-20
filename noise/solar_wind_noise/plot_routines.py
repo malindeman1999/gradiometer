@@ -110,6 +110,7 @@ def plot_noise_results(
     gradiometer_amplitude_label="Amplitude [pT]",
     gradiometer_psd_label="PSD [pT^2/Hz]",
     gradiometer_plot_asd=False,
+    solar_wind_plot_asd=False,
     gradiometer_rms_band=None,
     sensor_rms_band=None,
 ):
@@ -139,13 +140,16 @@ def plot_noise_results(
     f_plot = f[positive_freq_mask]
     psd_ave_plot = PSD_ave[positive_freq_mask] * psd_scale
     psd_theory_plot = PSD_theory[positive_freq_mask] * psd_scale
+    if solar_wind_plot_asd:
+        psd_ave_plot = np.sqrt(np.maximum(psd_ave_plot, 0.0))
+        psd_theory_plot = np.sqrt(np.maximum(psd_theory_plot, 0.0))
 
     # Frequency domain
     ax[0].loglog(f_plot, psd_ave_plot, linewidth=2.2)
     ax[0].loglog(f_plot, psd_theory_plot, c="red")
     ax[0].set_title("Noise Frequency Spectrum")
     ax[0].set_xlabel("Frequency [Hz]")
-    ax[0].set_ylabel("PSD [pT^2/Hz]")
+    ax[0].set_ylabel("ASD [pT/\u221aHz]" if solar_wind_plot_asd else "PSD [pT^2/Hz]")
 
     next_plot = 1
     if gradiometer_transfer_power is not None:
@@ -153,11 +157,12 @@ def plot_noise_results(
         transfer_mask = transfer_freq > 0
         transfer_freq_plot = transfer_freq[transfer_mask]
         transfer_power_plot = gradiometer_transfer_power[transfer_mask]
-        ax[next_plot].semilogx(transfer_freq_plot, transfer_power_plot, linewidth=2.2)
+        transfer_mag_plot = np.sqrt(np.maximum(transfer_power_plot, 0.0))
+        ax[next_plot].loglog(transfer_freq_plot, transfer_mag_plot, linewidth=2.2)
 
-        ax[next_plot].set_title("Gradiometer Transfer Power")
+        ax[next_plot].set_title("Field-to-Gradient Transfer Magnitude")
         ax[next_plot].set_xlabel("Frequency [Hz]")
-        ax[next_plot].set_ylabel("Transfer Power [1]")
+        ax[next_plot].set_ylabel("Field-to-Gradient Transfer Magnitude [1/m]")
         next_plot += 1
 
     if gradiometer_psd_theory is not None:
@@ -257,7 +262,7 @@ def plot_noise_results(
 
     if gradiometer_noise_t is not None and gradiometer_t is not None:
         ax[next_plot].plot(gradiometer_t, gradiometer_noise_t * gradiometer_amplitude_scale)
-        ax[next_plot].set_title("Gradiometer Noise Time Domain (Last Realization)")
+        ax[next_plot].set_title("Gradiometer Noise Time Domain")
         ax[next_plot].set_xlabel("Time [s]")
         ax[next_plot].set_ylabel(gradiometer_amplitude_label)
         next_plot += 1

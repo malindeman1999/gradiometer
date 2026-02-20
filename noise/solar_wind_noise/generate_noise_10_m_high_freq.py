@@ -137,5 +137,6 @@ plot_noise_results(
     gradiometer_amplitude_label="Amplitude [pT/m]",
     gradiometer_psd_label="ASD [pT/(m*√Hz)]",
     gradiometer_plot_asd=True,
+    solar_wind_plot_asd=True,
 )
 
